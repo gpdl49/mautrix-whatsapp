@@ -178,6 +178,13 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 	if pn.IsEmpty() {
 		cooldownKey = lid.String()
 	}
+	// Mirror handleWACallStart: DMs are addressed and portal-keyed by the
+	// caller's LID when one is known, otherwise by the phone number. Using
+	// anything else would create a duplicate portal.
+	dm := lid
+	if dm.IsEmpty() {
+		dm = pn
+	}
 
 	if err := wa.Client.RejectCall(ctx, caller, meta.CallID); err != nil {
 		log.Err(err).Msg("Failed to reject incoming call")
@@ -210,7 +217,7 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 		replyText, err = renderCallReply(tmpl, data)
 		if err != nil {
 			log.Err(err).Msg("Failed to render call auto-reply")
-		} else if _, err = wa.Client.SendMessage(ctx, caller, &waE2E.Message{Conversation: proto.String(replyText)}); err != nil {
+		} else if _, err = wa.Client.SendMessage(ctx, dm, &waE2E.Message{Conversation: proto.String(replyText)}); err != nil {
 			log.Err(err).Msg("Failed to send call auto-reply")
 		} else {
 			sent = true
@@ -222,7 +229,7 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 
 	chat := meta.GroupJID
 	if chat.IsEmpty() {
-		chat = caller
+		chat = dm
 	}
 	res := wa.UserLogin.QueueRemoteEvent(&simplevent.Message[callReplyNotice]{
 		EventMeta: simplevent.EventMeta{
@@ -233,7 +240,7 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 			Timestamp:    time.Now(),
 			StreamOrder:  time.Now().Unix(),
 		},
-		ID:                 waid.MakeFakeMessageID(chat, caller, "call-reply-"+meta.CallID),
+		ID:                 waid.MakeFakeMessageID(chat, dm, "call-reply-"+meta.CallID),
 		Data:               callReplyNotice{Data: data, ReplyText: replyText, Sent: sent},
 		ConvertMessageFunc: convertCallReplyNotice,
 	})
