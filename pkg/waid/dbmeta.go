@@ -45,6 +45,8 @@ type UserLoginMetadata struct {
 	ReachoutTimelockUntil          time.Time `json:"reachout_timelock_until,omitzero"`
 
 	MData json.RawMessage `json:"mdata,omitempty"`
+
+	CallAutoReply *CallAutoReplySettings `json:"call_auto_reply,omitempty"` // homestacks: call auto-reply
 }
 
 type PushKeys struct {

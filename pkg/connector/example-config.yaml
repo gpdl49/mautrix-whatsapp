@@ -130,3 +130,26 @@ history_sync:
     # Use on-demand history sync requests for fetching older messages?
     # This only applies when using the backfill queue, never for forward backfills.
     backwards_on_demand: false
+
+# homestacks: call auto-reply (see HOMESTACKS.md). WhatsApp calls can't be answered through the
+# bridge; instead the bridge declines them and texts the caller. Users can override the message
+# and toggle the feature for their own login with `!wa call-reply`.
+call_auto_reply:
+    # Decline incoming calls and send the auto-reply?
+    enabled: false
+    # Text sent to the caller. Go template with these placeholders:
+    # {{.Name}}     - caller's contact name, push name or business name (falls back to the phone number)
+    # {{.Phone}}    - caller's phone number in international format
+    # {{.CallLink}} - a freshly generated link under call_link_base_url, empty if that is unset
+    # {{.CallType}} - "audio" or "video" when known
+    message: "Hi {{.Name}}, I can't receive WhatsApp calls on this number. You can call me right now here instead: {{.CallLink}}"
+    # Base URL for generated call links, e.g. https://call.element.io for hosted Element Call
+    # or a self-hosted standalone Element Call. A random room name is appended per call.
+    # The same link is posted in the Matrix portal so the user can join from Matrix.
+    call_link_base_url: https://call.element.io
+    # Minimum time between auto-reply texts to the same caller. Calls are still declined
+    # and still produce a Matrix notice during the cooldown.
+    cooldown: 10m
+    # Also respond to group calls? Off by default: texting a group because someone
+    # started a call in it is rarely what you want.
+    include_group_calls: false

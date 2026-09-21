@@ -77,6 +77,7 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		log := w.UserLogin.Log.With().Str("component", "whatsmeow").Logger()
 		w.Client = whatsmeow.NewClient(w.Device, waLog.Zerolog(log))
 		w.Client.AddEventHandlerWithSuccessStatus(w.handleWAEvent)
+		w.Client.AddEventHandlerWithSuccessStatus(w.handleCallAutoReply) // homestacks: call auto-reply
 		w.Client.SynchronousAck = true
 		w.Client.EnableDecryptedEventBuffer = wa.Bridge.Config.PortalEventBuffer == 0
 		w.Client.ManualHistorySyncDownload = true

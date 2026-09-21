@@ -56,6 +56,7 @@ type Config struct {
 	LazyAvatars                 bool          `yaml:"lazy_avatars"`
 
 	AnimatedSticker msgconv.AnimatedStickerConfig `yaml:"animated_sticker"`
+	CallAutoReply   CallAutoReplyConfig           `yaml:"call_auto_reply"` // homestacks: call auto-reply
 
 	HistorySync struct {
 		MaxInitialConversations int           `yaml:"max_initial_conversations"`
@@ -101,7 +102,7 @@ func (c *Config) PostProcess() error {
 	if err != nil {
 		return fmt.Errorf("failed to execute displayname template: %w", err)
 	}
-	return nil
+	return c.CallAutoReply.postProcess() // homestacks: call auto-reply
 }
 
 func upgradeConfig(helper up.Helper) {
@@ -138,6 +139,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Int, "animated_sticker", "args", "width")
 	helper.Copy(up.Int, "animated_sticker", "args", "height")
 	helper.Copy(up.Int, "animated_sticker", "args", "fps")
+	upgradeCallAutoReplyConfig(helper) // homestacks: call auto-reply
 
 	helper.Copy(up.Int, "history_sync", "max_initial_conversations")
 	helper.Copy(up.Bool, "history_sync", "request_full_sync")
@@ -211,6 +213,7 @@ func (wa *WhatsAppConnector) GetConfig() (string, any, up.Upgrader) {
 			{"call_start_notices"},
 			{"animated_sticker"},
 			{"history_sync"},
+			{"call_auto_reply"}, // homestacks: call auto-reply
 		},
 		Base: ExampleConfig,
 	}

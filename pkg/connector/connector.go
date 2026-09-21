@@ -111,6 +111,7 @@ func (wa *WhatsAppConnector) Init(bridge *bridgev2.Bridge) {
 	wa.MsgConv.DB = wa.DB
 	wa.Bridge.Commands.(*commands.Processor).AddHandlers(
 		cmdAccept, cmdSync, cmdInviteLink, cmdResolveLink, cmdJoin,
+		cmdCallReply, // homestacks: call auto-reply
 	)
 	wa.mediaEditCache = make(MediaEditCache)
 	wa.unmigratedDMs = exsync.NewSet[networkid.PortalKey]()
