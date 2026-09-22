@@ -12,13 +12,43 @@ upstream merge conflicts.
 
 1. declines the call (`whatsmeow.Client.RejectCall`), so the caller hears "declined" instead of ringing out;
 2. texts the caller a configurable message, rendered from a Go template with `{{.Name}}`, `{{.Phone}}`,
-   `{{.CallType}}` and `{{.CallLink}}` — a freshly generated
-   `<call_link_base_url>/<random>` link (Element Call by default);
+   `{{.CallType}}` and `{{.CallLink}}` — an Element Call link to a Matrix room created for this
+   call (see **Call links** below);
 3. posts a notice, as the user, into the Matrix portal with the same link, so the user is effectively
    "rung" on Matrix and can click straight into the call.
 
 A caller only gets one text per `cooldown` (default 10m) no matter how often they retry; calls are still
 declined and still produce a Matrix notice. Group calls are ignored unless `include_group_calls` is set.
+
+### Call links
+
+Element Call **never creates a room from a link**; it only joins a room whose ID is already in the
+URL fragment. So `{{.CallLink}}` is only useful if a real room exists behind it, and the bridge
+creates one per call: public, unencrypted, `history_visibility: joined`, discarded after `room_ttl`.
+
+Three things about that room are load-bearing, and each fails in a way that looks like something
+else:
+
+- **Members must be allowed to publish their own call membership.** A room created with
+  `preset: public_chat` gets `state_default: 50` while a joined caller has `users_default: 0`, so
+  Element Call is refused when it writes its membership state and tears the call down within
+  milliseconds. From the browser this is indistinguishable from broken media. Both event names are
+  granted (`m.rtc.member` and the legacy `org.matrix.msc3401.call.member`) because current clients
+  write the legacy one, and granting only the newer name looks right and changes nothing.
+- **The user is joined, not invited.** The ring only reaches a joined member, so the bridge joins
+  them through the double puppet. Without double puppeting it falls back to an invite and logs a
+  warning — calls will not ring until the invite is accepted, which defeats the point.
+- **`guest_homeserver_url` is required.** Element Call registers the caller a real account via
+  `/register`; left to itself it uses a guest server that federates with nothing, so the link loads
+  and then fails exactly when the call starts. The bridge refuses to start rather than hand out
+  links that cannot work. It needs a homeserver with open registration that federates with wherever
+  the call rooms live — not your main homeserver.
+
+`sendNotificationType=ring` in the link makes Element Call emit the ring notification itself once
+the caller is actually in the call, so the bridge needs no ring code and the user is only rung when
+there is something to answer.
+
+The homestacks repo's `docs/matrix-call-links.md` has the full derivation, including the dead ends.
 
 Users tweak it per login from the bot DM:
 
@@ -70,6 +100,7 @@ New files:
 | File | Purpose |
 |---|---|
 | `pkg/connector/callreply.go` | event handler, decline + text + Matrix notice, dedupe/cooldown tracker |
+| `pkg/connector/callroom.go` | per-call Matrix room, power levels, double-puppet join, link builder, TTL cleanup |
 | `pkg/connector/callreply_config.go` | `CallAutoReplyConfig`, template parsing/validation, config upgrader |
 | `pkg/connector/callreply_command.go` | `!wa call-reply` |
 | `pkg/connector/callreply_test.go` | unit tests for the pure parts |
@@ -89,7 +120,8 @@ git tag vX.Y.Z-hs.1 && git push origin vX.Y.Z-hs.1   # publish.yml builds the im
 ```
 
 If upstream changed something the feature relies on (`RejectCall`, `BasicCallMeta`, `QueueRemoteEvent`,
-`commands.FullHandler`, `configupgrade`), the build or `go vet` step will say so; fix it in the `callreply*`
+`commands.FullHandler`, `configupgrade`, `MatrixAPI.CreateRoom`/`EnsureJoined`/`DeleteRoom`,
+`User.DoublePuppet`), the build or `go vet` step will say so; fix it in the `callreply*`/`callroom.go`
 files rather than in upstream code.
 
 ## Building locally

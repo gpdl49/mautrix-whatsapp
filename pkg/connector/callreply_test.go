@@ -18,13 +18,17 @@ package connector
 
 import (
 	"context"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestCallAutoReplyConfigPostProcess(t *testing.T) {
-	cfg := CallAutoReplyConfig{CallLinkBaseURL: " https://call.example.org/ "}
+	cfg := CallAutoReplyConfig{
+		CallLinkBaseURL:    " https://call.example.org/ ",
+		GuestHomeserverURL: " https://guests.example.org/ ",
+	}
 	if err := cfg.postProcess(); err != nil {
 		t.Fatalf("postProcess: %v", err)
 	}
@@ -34,8 +38,23 @@ func TestCallAutoReplyConfigPostProcess(t *testing.T) {
 	if cfg.CallLinkBaseURL != "https://call.example.org" {
 		t.Errorf("base URL should be trimmed, got %q", cfg.CallLinkBaseURL)
 	}
+	if cfg.GuestHomeserverURL != "https://guests.example.org" {
+		t.Errorf("guest homeserver URL should be trimmed, got %q", cfg.GuestHomeserverURL)
+	}
 	if cfg.messageTemplate == nil {
 		t.Error("template should be parsed")
+	}
+
+	// A link with no guest homeserver loads fine and then fails at the point
+	// the call starts, which is the worst possible time to find out. Startup
+	// must refuse it rather than hand callers a link that cannot work.
+	noGuest := CallAutoReplyConfig{CallLinkBaseURL: "https://call.example.org"}
+	if err := noGuest.postProcess(); err == nil {
+		t.Error("call_link_base_url without guest_homeserver_url should be rejected at startup")
+	}
+	// Neither set is a valid configuration: no link is generated at all.
+	if err := (&CallAutoReplyConfig{}).postProcess(); err != nil {
+		t.Errorf("no link configured at all should be fine: %v", err)
 	}
 
 	bad := CallAutoReplyConfig{Message: "hello {{.Nope}}"}
@@ -129,5 +148,69 @@ func TestConvertCallReplyNotice(t *testing.T) {
 	body := msg.Parts[0].Content.Body
 	if !strings.Contains(body, "unknown caller") || !strings.Contains(body, "cooldown") {
 		t.Errorf("unexpected fallback body: %q", body)
+	}
+}
+
+func TestBuildCallLink(t *testing.T) {
+	cfg := CallAutoReplyConfig{
+		CallLinkBaseURL:    "https://call.example.org",
+		GuestHomeserverURL: "https://guests.example.org",
+		ViaServers:         []string{"example.org"},
+	}
+	link := cfg.buildCallLink("!abc:example.org")
+
+	base, query, found := strings.Cut(link, "?")
+	if !found {
+		t.Fatalf("link has no query: %q", link)
+	}
+	// Element Call reads everything from the fragment; a link that puts the
+	// room in the path is the deprecated form and creates nothing.
+	if base != "https://call.example.org/room/#/callback" {
+		t.Errorf("unexpected link base %q", base)
+	}
+	q, err := url.ParseQuery(query)
+	if err != nil {
+		t.Fatalf("parse query: %v", err)
+	}
+	if got := q.Get("roomId"); got != "!abc:example.org" {
+		t.Errorf("roomId = %q", got)
+	}
+	if got := q.Get("homeserver"); got != "https://guests.example.org" {
+		t.Errorf("homeserver = %q -- without this the caller registers somewhere that cannot reach the room", got)
+	}
+	if got := q.Get("viaServers"); got != "example.org" {
+		t.Errorf("viaServers = %q", got)
+	}
+	if got := q.Get("sendNotificationType"); got != "ring" {
+		t.Errorf("sendNotificationType = %q -- this is what rings the user", got)
+	}
+	// The password is the call's media encryption key and the link is the only
+	// credential a caller has, so it must be present and not trivially short.
+	if pw := q.Get("password"); len(pw) < 16 {
+		t.Errorf("password = %q, want something unguessable", pw)
+	}
+
+	// Two links for the same room must not share a media key.
+	if cfg.buildCallLink("!abc:example.org") == link {
+		t.Error("two links for the same room produced an identical password")
+	}
+}
+
+func TestCallRoomMemberEventsArePermitted(t *testing.T) {
+	// Both names on purpose: current clients write the legacy
+	// org.matrix.msc3401.call.member, and granting only m.rtc.member looks
+	// correct while leaving the call unable to start.
+	want := map[string]bool{"m.rtc.member": false, "org.matrix.msc3401.call.member": false}
+	for _, evt := range callRoomMemberEvents {
+		if _, ok := want[evt]; !ok {
+			t.Errorf("unexpected event type %q", evt)
+			continue
+		}
+		want[evt] = true
+	}
+	for evt, seen := range want {
+		if !seen {
+			t.Errorf("%s must be granted to members or the call cannot start", evt)
+		}
 	}
 }

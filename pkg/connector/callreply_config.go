@@ -35,6 +35,19 @@ type CallAutoReplyConfig struct {
 	Cooldown          time.Duration `yaml:"cooldown"`
 	IncludeGroupCalls bool          `yaml:"include_group_calls"`
 
+	// GuestHomeserverURL is the homeserver Element Call registers the caller
+	// on. It must federate with the homeserver the call room lives on. Without
+	// it Element Call uses its own default guest server, which federates with
+	// nothing, so the caller can never reach the room -- hence the hard failure
+	// in postProcess rather than a link that looks fine and cannot work.
+	GuestHomeserverURL string `yaml:"guest_homeserver_url"`
+	// ViaServers are the servers Element Call should try when joining the room
+	// over federation. Normally just the server the call room is created on.
+	ViaServers []string `yaml:"via_servers"`
+	// RoomTTL is how long a call room is kept before the bridge and the user
+	// leave it. Zero keeps rooms forever.
+	RoomTTL time.Duration `yaml:"room_ttl"`
+
 	messageTemplate *template.Template `yaml:"-"`
 }
 
@@ -56,7 +69,10 @@ func upgradeCallAutoReplyConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "call_auto_reply", "enabled")
 	helper.Copy(up.Str, "call_auto_reply", "message")
 	helper.Copy(up.Str|up.Null, "call_auto_reply", "call_link_base_url")
+	helper.Copy(up.Str|up.Null, "call_auto_reply", "guest_homeserver_url")
+	helper.Copy(up.List|up.Null, "call_auto_reply", "via_servers")
 	helper.Copy(up.Str|up.Int, "call_auto_reply", "cooldown")
+	helper.Copy(up.Str|up.Int|up.Null, "call_auto_reply", "room_ttl")
 	helper.Copy(up.Bool, "call_auto_reply", "include_group_calls")
 }
 
@@ -73,6 +89,14 @@ func (c *CallAutoReplyConfig) postProcess() error {
 		return fmt.Errorf("failed to parse call_auto_reply.message template: %w", err)
 	}
 	c.CallLinkBaseURL = strings.TrimSuffix(strings.TrimSpace(c.CallLinkBaseURL), "/")
+	c.GuestHomeserverURL = strings.TrimSuffix(strings.TrimSpace(c.GuestHomeserverURL), "/")
+	// A base URL with no guest homeserver produces a link that loads, registers
+	// the caller somewhere that cannot reach the room, and fails at the point
+	// the call starts. That is far worse than refusing to start, so refuse.
+	if c.CallLinkBaseURL != "" && c.GuestHomeserverURL == "" {
+		return fmt.Errorf("call_auto_reply.guest_homeserver_url is required when call_link_base_url is set: " +
+			"without it Element Call registers callers on a homeserver that cannot reach the call room")
+	}
 	return nil
 }
 

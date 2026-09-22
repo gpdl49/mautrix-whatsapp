@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"go.mau.fi/util/random"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -33,6 +32,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
@@ -199,11 +199,21 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 	if !pn.IsEmpty() {
 		data.Phone = "+" + pn.User
 	}
-	if base := wa.Main.Config.CallAutoReply.CallLinkBaseURL; base != "" {
-		data.CallLink = base + "/" + random.String(16)
-	}
 	if data.Name == "" {
 		data.Name = data.Phone
+	}
+
+	// Create the room the caller will be sent to. Element Call only ever joins
+	// a room that already exists, so the link is worthless without this.
+	var callRoomID id.RoomID
+	if wa.Main.Config.CallAutoReply.CallLinkBaseURL != "" {
+		var err error
+		callRoomID, data.CallLink, err = wa.createCallRoom(ctx, data.Name)
+		if err != nil {
+			// Send the text anyway: a caller being told "I can't take WhatsApp
+			// calls" without a link is still better than silence.
+			log.Err(err).Msg("Failed to create the call room; replying without a link")
+		}
 	}
 
 	var replyText string
@@ -246,6 +256,12 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 	})
 	if !res.Success {
 		log.Warn().Msg("Failed to queue call auto-reply notice to Matrix")
+	}
+
+	// Call rooms are per-call and disposable; drop this one after the TTL so
+	// they do not accumulate one per missed call forever.
+	if callRoomID != "" {
+		wa.scheduleCallRoomCleanup(callRoomID, wa.Main.Config.CallAutoReply.RoomTTL)
 	}
 }
 

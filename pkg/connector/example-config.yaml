@@ -140,13 +140,38 @@ call_auto_reply:
     # Text sent to the caller. Go template with these placeholders:
     # {{.Name}}     - caller's contact name, push name or business name (falls back to the phone number)
     # {{.Phone}}    - caller's phone number in international format
-    # {{.CallLink}} - a freshly generated link under call_link_base_url, empty if that is unset
+    # {{.CallLink}} - link to a Matrix room created for this call, empty if call links are off
     # {{.CallType}} - "audio" or "video" when known
     message: "Hi {{.Name}}, I can't receive WhatsApp calls on this number. You can call me right now here instead: {{.CallLink}}"
-    # Base URL for generated call links, e.g. https://call.element.io for hosted Element Call
-    # or a self-hosted standalone Element Call. A random room name is appended per call.
-    # The same link is posted in the Matrix portal so the user can join from Matrix.
+    #
+    # Call links. Leave call_link_base_url empty to disable them entirely and just decline
+    # calls with a text.
+    #
+    # Element Call never creates a room from a link -- it only joins a room whose ID is
+    # already in the URL -- so the bridge creates one unencrypted, public room per call,
+    # joins you to it through your double puppet (the ring only reaches a joined member),
+    # and discards it after room_ttl.
+    #
+    # Base URL of an Element Call deployment; the hosted one works, it is only used as a
+    # static app. No trailing path.
     call_link_base_url: https://call.element.io
+    # Homeserver the caller is registered on. REQUIRED when call_link_base_url is set, and
+    # the bridge refuses to start without it -- Element Call otherwise registers callers on
+    # its own default guest server, which federates with nothing, so the link loads and then
+    # fails at the moment the call starts.
+    #
+    # This must be a homeserver with open registration that federates with the server the
+    # call rooms live on. Do not point it at your main homeserver unless that has open
+    # registration, which it should not.
+    guest_homeserver_url: https://guests.example.com
+    # Servers Element Call should try when joining the call room over federation. Normally
+    # just the server the bridge creates rooms on.
+    via_servers:
+        - example.com
+    # How long to keep a call room before the bridge and you leave it. Call rooms are
+    # per-call and disposable; without this they accumulate one per missed call. 0 keeps
+    # them forever.
+    room_ttl: 1h
     # Minimum time between auto-reply texts to the same caller. Calls are still declined
     # and still produce a Matrix notice during the cooldown.
     cooldown: 10m
