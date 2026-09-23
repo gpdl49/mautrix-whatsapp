@@ -106,6 +106,51 @@ New files:
 | `pkg/connector/callreply_test.go` | unit tests for the pure parts |
 | `pkg/waid/callreply.go` | per-login settings stored in login metadata |
 
+## Upstreaming
+
+The fork is two features that happen to share a config section, and only one of
+them is plausible upstream:
+
+| | Upstreamable | Why |
+|---|---|---|
+| Decline incoming calls + text the caller | **Yes** | Self-contained, no assumptions about anyone's infrastructure. WhatsApp calls genuinely cannot be answered through the bridge, so every user of this bridge has the problem. |
+| Per-call Matrix room and Element Call link | **No** | Needs a second homeserver with open registration, federation between it and your own, and an SFU. Far too opinionated to ask upstream to carry. |
+
+The split is marked in code: `grep -rn 'call-link:' pkg/` lists every point that
+belongs to the second feature. Four hits, and they are not all the same kind —
+two in `callreply.go` are the actual seams, both `if` blocks inside
+`autoReplyToCall` that can be deleted outright; two in `callreply_config.go`
+mark the config fields and the `CallLink` placeholder that go with them.
+
+To prepare an upstream PR, on a branch off upstream `main`:
+
+1. Take `callreply.go`, `callreply_config.go`, `callreply_command.go`,
+   `callreply_test.go` and `pkg/waid/callreply.go` as they are.
+2. Delete `callroom.go`, and delete the two `call-link:` blocks in
+   `autoReplyToCall` along with the `callRoomID` variable they share.
+3. Drop `CallLink` from `callReplyTemplateData`, and the four call-link fields
+   (`CallLinkBaseURL`, `GuestHomeserverURL`, `ViaServers`, `RoomTTL`) from
+   `CallAutoReplyConfig`, their `helper.Copy` lines, and the
+   `guest_homeserver_url` check in `postProcess`.
+4. Change the default message, which currently ends in `{{.CallLink}}`. Something
+   like `"Hi {{.Name}}, I can't receive WhatsApp calls on this number."`
+5. Trim `example-config.yaml` to the surviving keys: `enabled`, `message`,
+   `cooldown`, `include_group_calls`.
+6. Drop `TestBuildCallLink` and `TestCallRoomMemberEventsArePermitted`, and the
+   call-link assertions in `TestCallAutoReplyConfigPostProcess`. The rest of the
+   tests apply unchanged.
+7. Keep the `// homestacks:` hook comments out of it — rename or drop them, they
+   are a marker for this fork's merge conflicts and mean nothing upstream.
+
+What is left is: decline the call, render a template, send it, post a notice,
+with a per-caller cooldown and a `!wa call-reply` command. Nothing in it refers
+to Element Call, Matrix RTC, or a guest homeserver.
+
+Two things worth raising in such a PR rather than hiding: it adds a second
+whatsmeow event handler next to `handleWAEvent` (deliberately, so upstream call
+handling stays untouched), and it wants `call_start_notices: false` alongside or
+users get two notices per call.
+
 ## Resolving an upstream merge conflict by hand
 
 ```sh

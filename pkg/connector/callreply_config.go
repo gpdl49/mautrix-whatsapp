@@ -35,6 +35,10 @@ type CallAutoReplyConfig struct {
 	Cooldown          time.Duration `yaml:"cooldown"`
 	IncludeGroupCalls bool          `yaml:"include_group_calls"`
 
+	// call-link: the settings below drive the per-call Matrix room in
+	// callroom.go. They are the non-upstreamable half of this feature; see
+	// "Upstreaming" in HOMESTACKS.md before moving any of it.
+	//
 	// GuestHomeserverURL is the homeserver Element Call registers the caller
 	// on. It must federate with the homeserver the call room lives on. Without
 	// it Element Call uses its own default guest server, which federates with
@@ -57,7 +61,8 @@ type callReplyTemplateData struct {
 	Name string
 	// Phone is the caller's phone number in international format, or empty if only a LID is known.
 	Phone string
-	// CallLink is the generated Element Call link, or empty if call_link_base_url is unset.
+	// CallLink is the link to this call's Matrix room, or empty if call links
+	// are disabled or the room could not be created. call-link: see callroom.go.
 	CallLink string
 	// CallType is "audio" or "video" when WhatsApp told us, otherwise empty.
 	CallType string

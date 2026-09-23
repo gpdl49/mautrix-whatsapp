@@ -203,8 +203,10 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 		data.Name = data.Phone
 	}
 
-	// Create the room the caller will be sent to. Element Call only ever joins
-	// a room that already exists, so the link is worthless without this.
+	// call-link: create the room the caller will be sent to. Element Call only
+	// ever joins a room that already exists, so the link is worthless without
+	// this. Everything behind this seam lives in callroom.go and is the part of
+	// the fork that is NOT upstreamable -- see "Upstreaming" in HOMESTACKS.md.
 	var callRoomID id.RoomID
 	if wa.Main.Config.CallAutoReply.CallLinkBaseURL != "" {
 		var err error
@@ -258,8 +260,8 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 		log.Warn().Msg("Failed to queue call auto-reply notice to Matrix")
 	}
 
-	// Call rooms are per-call and disposable; drop this one after the TTL so
-	// they do not accumulate one per missed call forever.
+	// call-link: call rooms are per-call and disposable; drop this one after the
+	// TTL so they do not accumulate one per missed call forever.
 	if callRoomID != "" {
 		wa.scheduleCallRoomCleanup(callRoomID, wa.Main.Config.CallAutoReply.RoomTTL)
 	}
