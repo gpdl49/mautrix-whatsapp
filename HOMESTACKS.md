@@ -12,7 +12,7 @@ upstream merge conflicts.
 
 1. declines the call (`whatsmeow.Client.RejectCall`), so the caller hears "declined" instead of ringing out;
 2. texts the caller a configurable message, rendered from a Go template with `{{.Name}}`, `{{.Phone}}`,
-   `{{.CallType}}` and `{{.CallLink}}` — an Element Call link to a Matrix room created for this
+   `{{.CallType}}`, `{{.Account}}` (the user's own number that was called) and `{{.CallLink}}` — an Element Call link to a Matrix room created for this
    call (see **Call links** below);
 3. posts a notice, as the user, into the Matrix portal with the same link, so the user is effectively
    "rung" on Matrix and can click straight into the call.
@@ -58,6 +58,12 @@ Users tweak it per login from the bot DM:
 !wa call-reply clear
 !wa call-reply on | off
 ```
+
+With several WhatsApp logins on one Matrix account, each login declines, texts and rings on its own,
+with its own cooldown and settings. The command then needs to know which login it is for: name it
+first (`!wa call-reply 15550000001 show`, with or without `+`), or run the command in one of that
+login's chats. With a single login nothing changes. Without either it refuses and lists the logins
+rather than guess.
 
 Set upstream's `call_start_notices: false` alongside, otherwise both the upstream "Incoming call" notice
 and ours appear.

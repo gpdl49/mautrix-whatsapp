@@ -17,12 +17,16 @@
 package connector
 
 import (
+	"errors"
 	"fmt"
 	"html"
+	"slices"
 	"strings"
 
 	"go.mau.fi/util/ptr"
+	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
@@ -35,16 +39,54 @@ var cmdCallReply = &commands.FullHandler{
 	Help: commands.HelpMeta{
 		Section:     commands.HelpSectionGeneral,
 		Description: "Manage the automatic text sent to people who call you on WhatsApp.",
-		Args:        "<show|set <message>|clear|on|off>",
+		Args:        "[_login ID_] <show|set <message>|clear|on|off>",
 	},
 	RequiresLogin: true,
 }
 
-const callReplyUsage = "Usage: `$cmdprefix call-reply <show|set <message>|clear|on|off>`\n\n" +
-	"Placeholders for `set`: `{{.Name}}` (caller's name), `{{.Phone}}`, `{{.CallLink}}` (Element Call link), `{{.CallType}}`."
+const callReplyUsage = "Usage: `$cmdprefix call-reply [login ID] <show|set <message>|clear|on|off>`\n\n" +
+	"With several WhatsApp logins, name the login (its phone number) or run the command in one of that login's chats.\n\n" +
+	"Placeholders for `set`: `{{.Name}}` (caller's name), `{{.Phone}}`, `{{.Account}}` (your number that was called), " +
+	"`{{.CallLink}}` (Element Call link), `{{.CallType}}`."
+
+var errCallReplyLoginAmbiguous = errors.New("ambiguous login")
+
+// selectCallReplyLogin picks the login a call-reply command applies to, in
+// order: a leading argument naming one of the user's logins (with or without
+// "+"), the receiver of the portal the command was sent in, or the user's only
+// login. consumedArg reports whether the first argument was the login ID.
+func selectCallReplyLogin(owned []networkid.UserLoginID, firstArg string, portalReceiver networkid.UserLoginID) (loginID networkid.UserLoginID, consumedArg bool, err error) {
+	if candidate := networkid.UserLoginID(strings.TrimPrefix(firstArg, "+")); candidate != "" && slices.Contains(owned, candidate) {
+		return candidate, true, nil
+	}
+	if portalReceiver != "" && slices.Contains(owned, portalReceiver) {
+		return portalReceiver, false, nil
+	}
+	if len(owned) == 1 {
+		return owned[0], false, nil
+	}
+	return "", false, errCallReplyLoginAmbiguous
+}
 
 func fnCallReply(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	var firstArg string
+	if len(ce.Args) > 0 {
+		firstArg = ce.Args[0]
+	}
+	var portalReceiver networkid.UserLoginID
+	if ce.Portal != nil {
+		portalReceiver = ce.Portal.Receiver
+	}
+	loginID, consumedArg, err := selectCallReplyLogin(ce.User.GetUserLoginIDs(), firstArg, portalReceiver)
+	if err != nil {
+		ce.Reply("You have several WhatsApp logins; name the one to change, e.g. `$cmdprefix call-reply <login ID> show`.\n\nYour logins:\n\n%s", ce.User.GetFormattedUserLogins())
+		return
+	}
+	if consumedArg {
+		ce.Args = ce.Args[1:]
+		ce.RawArgs = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ce.RawArgs), firstArg))
+	}
+	login := ce.Bridge.GetCachedUserLoginByID(loginID)
 	if login == nil {
 		ce.Reply("Login not found")
 		return
@@ -113,7 +155,7 @@ func fnCallReply(ce *commands.Event) {
 			ce.Reply("Failed to save settings: %v", err)
 			return
 		}
-		ce.Reply("Reset the call auto-reply message to the bridge default.")
+		ce.Reply("Reset the call auto-reply message for %s to the bridge default.", callReplyAccount(login))
 	case "on", "off":
 		if meta.CallAutoReply == nil {
 			meta.CallAutoReply = &waid.CallAutoReplySettings{}
@@ -123,8 +165,13 @@ func fnCallReply(ce *commands.Event) {
 			ce.Reply("Failed to save settings: %v", err)
 			return
 		}
-		ce.Reply("Call auto-reply is now %s for your login.", sub)
+		ce.Reply("Call auto-reply is now %s for %s.", sub, callReplyAccount(login))
 	default:
 		ce.Reply(callReplyUsage)
 	}
+}
+
+// callReplyAccount formats a login's own phone number the way callers see it.
+func callReplyAccount(login *bridgev2.UserLogin) string {
+	return "+" + waid.ParseUserLoginID(login.ID, 0).User
 }

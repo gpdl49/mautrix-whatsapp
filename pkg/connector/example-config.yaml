@@ -140,6 +140,7 @@ call_auto_reply:
     # Text sent to the caller. Go template with these placeholders:
     # {{.Name}}     - caller's contact name, push name or business name (falls back to the phone number)
     # {{.Phone}}    - caller's phone number in international format
+    # {{.Account}}  - your own number that was called (useful with several logins)
     # {{.CallLink}} - link to a Matrix room created for this call, empty if call links are off
     # {{.CallType}} - "audio" or "video" when known
     message: "Hi {{.Name}}, I can't receive WhatsApp calls on this number. You can call me right now here instead: {{.CallLink}}"

@@ -61,6 +61,9 @@ type callReplyTemplateData struct {
 	Name string
 	// Phone is the caller's phone number in international format, or empty if only a LID is known.
 	Phone string
+	// Account is the user's own number that was called, in international format.
+	// It tells callers apart when one Matrix user has several WhatsApp logins.
+	Account string
 	// CallLink is the link to this call's Matrix room, or empty if call links
 	// are disabled or the room could not be created. call-link: see callroom.go.
 	CallLink string
@@ -115,6 +118,7 @@ func parseCallReplyTemplate(text string) (*template.Template, error) {
 	_, err = renderCallReply(tmpl, callReplyTemplateData{
 		Name:     "Example",
 		Phone:    "+15550000000",
+		Account:  "+15550000001",
 		CallLink: "https://example.com/call",
 		CallType: "audio",
 	})

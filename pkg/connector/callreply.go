@@ -194,6 +194,7 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 
 	data := callReplyTemplateData{
 		Name:     wa.callerDisplayName(ctx, pn, lid),
+		Account:  callReplyAccount(wa.UserLogin),
 		CallType: callType,
 	}
 	if !pn.IsEmpty() {

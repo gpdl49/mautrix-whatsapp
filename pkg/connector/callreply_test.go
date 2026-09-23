@@ -22,6 +22,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 func TestCallAutoReplyConfigPostProcess(t *testing.T) {
@@ -212,5 +214,39 @@ func TestCallRoomMemberEventsArePermitted(t *testing.T) {
 		if !seen {
 			t.Errorf("%s must be granted to members or the call cannot start", evt)
 		}
+	}
+}
+
+func TestSelectCallReplyLogin(t *testing.T) {
+	two := []networkid.UserLoginID{"15550000001", "15550000002"}
+	tests := []struct {
+		name         string
+		owned        []networkid.UserLoginID
+		firstArg     string
+		receiver     networkid.UserLoginID
+		wantID       networkid.UserLoginID
+		wantConsumed bool
+		wantErr      bool
+	}{
+		{name: "only login", owned: two[:1], firstArg: "show", wantID: "15550000001"},
+		{name: "named login", owned: two, firstArg: "15550000002", wantID: "15550000002", wantConsumed: true},
+		{name: "named login with plus", owned: two, firstArg: "+15550000002", wantID: "15550000002", wantConsumed: true},
+		{name: "named login beats portal", owned: two, firstArg: "15550000002", receiver: "15550000001", wantID: "15550000002", wantConsumed: true},
+		{name: "portal receiver", owned: two, firstArg: "show", receiver: "15550000002", wantID: "15550000002"},
+		{name: "someone else's portal", owned: two, firstArg: "show", receiver: "15559999999", wantErr: true},
+		{name: "unknown login ID", owned: two, firstArg: "15559999999", wantErr: true},
+		{name: "ambiguous", owned: two, firstArg: "show", wantErr: true},
+		{name: "no logins", firstArg: "show", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id, consumed, err := selectCallReplyLogin(tt.owned, tt.firstArg, tt.receiver)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if id != tt.wantID || consumed != tt.wantConsumed {
+				t.Fatalf("got (%q, %v), want (%q, %v)", id, consumed, tt.wantID, tt.wantConsumed)
+			}
+		})
 	}
 }
