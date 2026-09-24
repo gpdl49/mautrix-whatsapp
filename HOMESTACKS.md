@@ -81,6 +81,26 @@ and groups, needs `call_link_base_url`, and has no cooldown — it only runs whe
 Set upstream's `call_start_notices: false` alongside, otherwise both the upstream "Incoming call" notice
 and ours appear.
 
+**Per-chat send limit.** A self-imposed cap on how much the user sends in a chat relative to the other
+side, set from the chat's own room:
+
+```
+!wa rate-limit reply [burst]            # up to burst (default 1) messages, then wait for a reply
+!wa rate-limit ratio 2:3 [burst]        # earn 2 messages per 3 of theirs, hold at most burst (default 2)
+!wa rate-limit show | off
+```
+
+A Matrix message over the limit is refused before it is converted or uploaded: it never reaches
+WhatsApp, is marked failed in Matrix, and the bridge's usual notice says why ("Your message was not
+bridged: rate limit for this chat … Wait for a reply"). No queueing or retries. Only messages and polls
+are limited; edits, reactions, deletes and the bridge's own `!wa call` invites are not.
+
+Counts come from the bridge's message table (last 200 messages, only those since the limit was set), so
+there is no counter to drift and nothing is lost on restart. Messages sent from the phone count toward
+the user's side and can overdraw the credit, but cannot be stopped. In groups "the other side" is
+everyone else combined. Settings live in portal metadata, so they are per chat and, with several
+logins, per login's chat. Setting a limit restarts it with full credit.
+
 ## Branches and tags
 
 | Ref | Meaning |
@@ -109,10 +129,11 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 | Upstream file | Hook |
 |---|---|
 | `pkg/connector/client.go` | registers `handleCallAutoReply` as a second whatsmeow event handler, right after `handleWAEvent` |
-| `pkg/connector/connector.go` | adds `cmdCallReply` and `cmdCall` to the command list |
+| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall` and `cmdRateLimit` to the command list |
+| `pkg/connector/handlematrix.go` | `checkSendLimit` guard (an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart` |
 | `pkg/connector/config.go` | `CallAutoReply` field on `Config`; `postProcess()` call at the end of `PostProcess`; `upgradeCallAutoReplyConfig(helper)` in `upgradeConfig`; `call_auto_reply` block entry in `GetConfig` |
 | `pkg/connector/example-config.yaml` | `call_auto_reply:` section appended at the end |
-| `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata` |
+| `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata`; `RateLimit` field on `PortalMetadata` |
 
 New files:
 
@@ -125,6 +146,10 @@ New files:
 | `pkg/connector/callinvite.go` | `!wa call`: call room + WhatsApp invite text, mirrored into the portal |
 | `pkg/connector/callreply_test.go` | unit tests for the pure parts |
 | `pkg/waid/callreply.go` | per-login settings stored in login metadata |
+| `pkg/connector/ratelimit.go` | per-chat send limit: history replay, credit arithmetic, refusal |
+| `pkg/connector/ratelimit_command.go` | `!wa rate-limit` |
+| `pkg/connector/ratelimit_test.go` | unit tests for the replay and argument parsing |
+| `pkg/waid/ratelimit.go` | per-chat settings stored in portal metadata |
 
 ## Upstreaming
 

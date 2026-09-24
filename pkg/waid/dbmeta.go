@@ -130,6 +130,7 @@ type PortalMetadata struct {
 	CommunityAnnouncementGroup bool                 `json:"is_cag,omitzero"`
 	AddressingMode             types.AddressingMode `json:"addressing_mode,omitempty"`
 	LIDMigrationAttempted      bool                 `json:"lid_migration_attempted,omitzero"`
+	RateLimit                  *RateLimitSettings   `json:"rate_limit,omitempty"` // homestacks: per-chat send limit
 }
 
 type GhostMetadata struct {

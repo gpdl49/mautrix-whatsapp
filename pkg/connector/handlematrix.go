@@ -49,6 +49,9 @@ var (
 )
 
 func (wa *WhatsAppClient) HandleMatrixPollStart(ctx context.Context, msg *bridgev2.MatrixPollStart) (result *bridgev2.MatrixMessageResponse, retErr error) {
+	if err := wa.checkSendLimit(ctx, msg.Portal); err != nil { // homestacks: per-chat send limit
+		return nil, err
+	}
 	waMsg, optionMap, err := wa.Main.MsgConv.PollStartToWhatsApp(ctx, msg.Content, msg.ReplyTo, msg.Portal)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert poll vote: %w", err)
@@ -78,6 +81,9 @@ func (wa *WhatsAppClient) HandleMatrixPollVote(ctx context.Context, msg *bridgev
 }
 
 func (wa *WhatsAppClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (result *bridgev2.MatrixMessageResponse, retErr error) {
+	if err := wa.checkSendLimit(ctx, msg.Portal); err != nil { // homestacks: per-chat send limit
+		return nil, err
+	}
 	waMsg, req, err := wa.Main.MsgConv.ToWhatsApp(ctx, wa.Client, msg.Event, msg.Content, msg.ReplyTo, msg.ThreadRoot, msg.Portal)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert message: %w", err)
