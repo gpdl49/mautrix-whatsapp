@@ -51,8 +51,12 @@ type CallAutoReplyConfig struct {
 	// RoomTTL is how long a call room is kept before the bridge and the user
 	// leave it. Zero keeps rooms forever.
 	RoomTTL time.Duration `yaml:"room_ttl"`
+	// InviteMessage is what `!wa call` texts the chat, with the same
+	// placeholders as Message. Phone and CallType are empty for groups.
+	InviteMessage string `yaml:"invite_message"`
 
 	messageTemplate *template.Template `yaml:"-"`
+	inviteTemplate  *template.Template `yaml:"-"`
 }
 
 // callReplyTemplateData is what the auto-reply message template is rendered with.
@@ -73,6 +77,8 @@ type callReplyTemplateData struct {
 
 const defaultCallAutoReplyMessage = "Hi {{.Name}}, I can't receive WhatsApp calls on this number. You can call me right now here instead: {{.CallLink}}"
 
+const defaultCallInviteMessage = "I'd like to call you. WhatsApp calls don't reach me, so please join here instead: {{.CallLink}}"
+
 func upgradeCallAutoReplyConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "call_auto_reply", "enabled")
 	helper.Copy(up.Str, "call_auto_reply", "message")
@@ -82,6 +88,7 @@ func upgradeCallAutoReplyConfig(helper up.Helper) {
 	helper.Copy(up.Str|up.Int, "call_auto_reply", "cooldown")
 	helper.Copy(up.Str|up.Int|up.Null, "call_auto_reply", "room_ttl")
 	helper.Copy(up.Bool, "call_auto_reply", "include_group_calls")
+	helper.Copy(up.Str, "call_auto_reply", "invite_message")
 }
 
 // postProcess parses and validates the message template. It is called from
@@ -95,6 +102,13 @@ func (c *CallAutoReplyConfig) postProcess() error {
 	c.messageTemplate, err = parseCallReplyTemplate(c.Message)
 	if err != nil {
 		return fmt.Errorf("failed to parse call_auto_reply.message template: %w", err)
+	}
+	if c.InviteMessage == "" {
+		c.InviteMessage = defaultCallInviteMessage
+	}
+	c.inviteTemplate, err = parseCallReplyTemplate(c.InviteMessage)
+	if err != nil {
+		return fmt.Errorf("failed to parse call_auto_reply.invite_message template: %w", err)
 	}
 	c.CallLinkBaseURL = strings.TrimSuffix(strings.TrimSpace(c.CallLinkBaseURL), "/")
 	c.GuestHomeserverURL = strings.TrimSuffix(strings.TrimSpace(c.GuestHomeserverURL), "/")

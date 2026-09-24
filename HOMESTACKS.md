@@ -57,13 +57,26 @@ Users tweak it per login from the bot DM:
 !wa call-reply set Hi {{.Name}}, no WhatsApp calls here — use {{.CallLink}}
 !wa call-reply clear
 !wa call-reply on | off
+!wa call-reply reset
 ```
+
+`on`/`off` is stored on the login and overrides the bridge-wide `enabled`, in either direction, so one
+number can auto-reply while another rings through untouched. `clear` drops the login's message,
+`reset` drops both its message and its on/off so it follows the bridge config again; `show` says which
+of the two each setting comes from.
 
 With several WhatsApp logins on one Matrix account, each login declines, texts and rings on its own,
 with its own cooldown and settings. The command then needs to know which login it is for: name it
-first (`!wa call-reply 15550000001 show`, with or without `+`), or run the command in one of that
-login's chats. With a single login nothing changes. Without either it refuses and lists the logins
-rather than guess.
+first (`!wa call-reply 15550000001 off`, with or without `+`), or run the command in one of that
+login's chats. With a single login nothing changes. Without either it refuses and lists every login
+with its current on/off rather than guess.
+
+**Outgoing calls.** WhatsApp contacts cannot join a call started in the (encrypted, bridged) portal
+room, so instead of pressing call there, run `!wa call` in the chat's room. The bridge makes a call
+room exactly as for an incoming call, texts the chat `invite_message` (same placeholders; `{{.Name}}` is
+the chat's name) from the login that owns the chat, and shows that text in the room as your own
+message. When the contact opens the link Element Call rings you, as with incoming calls. Works in DMs
+and groups, needs `call_link_base_url`, and has no cooldown — it only runs when you ask.
 
 Set upstream's `call_start_notices: false` alongside, otherwise both the upstream "Incoming call" notice
 and ours appear.
@@ -96,7 +109,7 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 | Upstream file | Hook |
 |---|---|
 | `pkg/connector/client.go` | registers `handleCallAutoReply` as a second whatsmeow event handler, right after `handleWAEvent` |
-| `pkg/connector/connector.go` | adds `cmdCallReply` to the command list |
+| `pkg/connector/connector.go` | adds `cmdCallReply` and `cmdCall` to the command list |
 | `pkg/connector/config.go` | `CallAutoReply` field on `Config`; `postProcess()` call at the end of `PostProcess`; `upgradeCallAutoReplyConfig(helper)` in `upgradeConfig`; `call_auto_reply` block entry in `GetConfig` |
 | `pkg/connector/example-config.yaml` | `call_auto_reply:` section appended at the end |
 | `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata` |
@@ -108,7 +121,8 @@ New files:
 | `pkg/connector/callreply.go` | event handler, decline + text + Matrix notice, dedupe/cooldown tracker |
 | `pkg/connector/callroom.go` | per-call Matrix room, power levels, double-puppet join, link builder, TTL cleanup |
 | `pkg/connector/callreply_config.go` | `CallAutoReplyConfig`, template parsing/validation, config upgrader |
-| `pkg/connector/callreply_command.go` | `!wa call-reply` |
+| `pkg/connector/callreply_command.go` | `!wa call-reply`, per-login selection and on/off resolution |
+| `pkg/connector/callinvite.go` | `!wa call`: call room + WhatsApp invite text, mirrored into the portal |
 | `pkg/connector/callreply_test.go` | unit tests for the pure parts |
 | `pkg/waid/callreply.go` | per-login settings stored in login metadata |
 

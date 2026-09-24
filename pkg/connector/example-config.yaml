@@ -179,3 +179,7 @@ call_auto_reply:
     # Also respond to group calls? Off by default: texting a group because someone
     # started a call in it is rarely what you want.
     include_group_calls: false
+    # Text sent by `!wa call`, run in a WhatsApp chat's room: it creates a call room like the
+    # ones above and sends the chat this message. Same placeholders as `message`; {{.Name}}
+    # is the chat's name, and {{.Phone}} is empty for groups. Needs call_link_base_url.
+    invite_message: "I'd like to call you. WhatsApp calls don't reach me, so please join here instead: {{.CallLink}}"

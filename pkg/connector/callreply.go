@@ -108,14 +108,11 @@ func (t *callReplyTracker) pruneLocked(now time.Time) {
 // per-login overrides from `!wa call-reply` win over the bridge config.
 func (wa *WhatsAppClient) callAutoReplySettings() (enabled bool, message string) {
 	cfg := &wa.Main.Config.CallAutoReply
-	enabled, message = cfg.Enabled, cfg.Message
-	if meta, ok := wa.UserLogin.Metadata.(*waid.UserLoginMetadata); ok && meta.CallAutoReply != nil {
-		if meta.CallAutoReply.Enabled != nil {
-			enabled = *meta.CallAutoReply.Enabled
-		}
-		if meta.CallAutoReply.Message != "" {
-			message = meta.CallAutoReply.Message
-		}
+	meta, _ := wa.UserLogin.Metadata.(*waid.UserLoginMetadata)
+	enabled, _ = callReplyEnabled(cfg, meta)
+	message = cfg.Message
+	if meta != nil && meta.CallAutoReply != nil && meta.CallAutoReply.Message != "" {
+		message = meta.CallAutoReply.Message
 	}
 	return
 }
@@ -211,7 +208,11 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 	var callRoomID id.RoomID
 	if wa.Main.Config.CallAutoReply.CallLinkBaseURL != "" {
 		var err error
-		callRoomID, data.CallLink, err = wa.createCallRoom(ctx, data.Name)
+		roomName := "Incoming WhatsApp call"
+		if data.Name != "" {
+			roomName = "WhatsApp call from " + data.Name
+		}
+		callRoomID, data.CallLink, err = wa.createCallRoom(ctx, roomName)
 		if err != nil {
 			// Send the text anyway: a caller being told "I can't take WhatsApp
 			// calls" without a link is still better than silence.

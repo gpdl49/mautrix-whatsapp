@@ -65,18 +65,13 @@ var callRoomMemberEvents = []string{
 // along with the link. The user is joined rather than invited: the ring only
 // reaches a joined member, and requiring the user to accept an invite per call
 // would defeat the point.
-func (wa *WhatsAppClient) createCallRoom(ctx context.Context, callerName string) (id.RoomID, string, error) {
+func (wa *WhatsAppClient) createCallRoom(ctx context.Context, name string) (id.RoomID, string, error) {
 	cfg := &wa.Main.Config.CallAutoReply
 	bot := wa.Main.Bridge.Bot
 
 	pls := &event.PowerLevelsEventContent{Events: map[string]int{}}
 	for _, evtType := range callRoomMemberEvents {
 		pls.Events[evtType] = 0
-	}
-
-	name := "Incoming WhatsApp call"
-	if callerName != "" {
-		name = "WhatsApp call from " + callerName
 	}
 
 	// Deliberately unencrypted. Element Call's own `password` gives the media

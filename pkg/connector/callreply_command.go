@@ -39,12 +39,13 @@ var cmdCallReply = &commands.FullHandler{
 	Help: commands.HelpMeta{
 		Section:     commands.HelpSectionGeneral,
 		Description: "Manage the automatic text sent to people who call you on WhatsApp.",
-		Args:        "[_login ID_] <show|set <message>|clear|on|off>",
+		Args:        "[_login ID_] <show|set <message>|clear|on|off|reset>",
 	},
 	RequiresLogin: true,
 }
 
-const callReplyUsage = "Usage: `$cmdprefix call-reply [login ID] <show|set <message>|clear|on|off>`\n\n" +
+const callReplyUsage = "Usage: `$cmdprefix call-reply [login ID] <show|set <message>|clear|on|off|reset>`\n\n" +
+	"`on`/`off` apply to one login only and override the bridge default; `clear` resets the message and `reset` resets both. " +
 	"With several WhatsApp logins, name the login (its phone number) or run the command in one of that login's chats.\n\n" +
 	"Placeholders for `set`: `{{.Name}}` (caller's name), `{{.Phone}}`, `{{.Account}}` (your number that was called), " +
 	"`{{.CallLink}}` (Element Call link), `{{.CallType}}`."
@@ -79,7 +80,7 @@ func fnCallReply(ce *commands.Event) {
 	}
 	loginID, consumedArg, err := selectCallReplyLogin(ce.User.GetUserLoginIDs(), firstArg, portalReceiver)
 	if err != nil {
-		ce.Reply("You have several WhatsApp logins; name the one to change, e.g. `$cmdprefix call-reply <login ID> show`.\n\nYour logins:\n\n%s", ce.User.GetFormattedUserLogins())
+		ce.Reply("You have several WhatsApp logins; name the one to change, e.g. `$cmdprefix call-reply <login ID> off`.\n\n%s", callReplyStatusList(ce))
 		return
 	}
 	if consumedArg {
@@ -113,17 +114,18 @@ func fnCallReply(ce *commands.Event) {
 		if enabled {
 			state = "enabled"
 		}
+		_, enabledSource := callReplyEnabled(&wa.Main.Config.CallAutoReply, meta)
 		source := "bridge default"
 		if meta.CallAutoReply != nil && meta.CallAutoReply.Message != "" {
-			source = "set by you"
+			source = "set for this login"
 		}
 		link := wa.Main.Config.CallAutoReply.CallLinkBaseURL
 		if link == "" {
 			link = "(no call link configured)"
 		}
 		ce.ReplyAdvanced(fmt.Sprintf(
-			"Call auto-reply is <b>%s</b>. Message (%s):<br><i>%s</i><br>Call link base: <code>%s</code>",
-			state, source, html.EscapeString(message), html.EscapeString(link),
+			"Call auto-reply for <code>%s</code> is <b>%s</b> (%s). Message (%s):<br><i>%s</i><br>Call link base: <code>%s</code>",
+			html.EscapeString(callReplyAccount(login)), state, enabledSource, source, html.EscapeString(message), html.EscapeString(link),
 		), false, true)
 	case "set":
 		text := strings.TrimSpace(strings.TrimPrefix(ce.RawArgs, ce.Args[0]))
@@ -166,6 +168,13 @@ func fnCallReply(ce *commands.Event) {
 			return
 		}
 		ce.Reply("Call auto-reply is now %s for %s.", sub, callReplyAccount(login))
+	case "reset":
+		meta.CallAutoReply = nil
+		if err := login.Save(ce.Ctx); err != nil {
+			ce.Reply("Failed to save settings: %v", err)
+			return
+		}
+		ce.Reply("Call auto-reply for %s now follows the bridge default (%s).", callReplyAccount(login), onOff(wa.Main.Config.CallAutoReply.Enabled))
 	default:
 		ce.Reply(callReplyUsage)
 	}
@@ -174,4 +183,40 @@ func fnCallReply(ce *commands.Event) {
 // callReplyAccount formats a login's own phone number the way callers see it.
 func callReplyAccount(login *bridgev2.UserLogin) string {
 	return "+" + waid.ParseUserLoginID(login.ID, 0).User
+}
+
+// callReplyEnabled resolves whether the auto-reply is on for a login and
+// describes where that came from: the login's own on/off, or the bridge default.
+func callReplyEnabled(cfg *CallAutoReplyConfig, meta *waid.UserLoginMetadata) (enabled bool, source string) {
+	if meta != nil && meta.CallAutoReply != nil && meta.CallAutoReply.Enabled != nil {
+		return *meta.CallAutoReply.Enabled, "set for this login"
+	}
+	return cfg.Enabled, "bridge default"
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+// callReplyStatusList lists every login of the command's user with its
+// effective on/off state, so picking one to change needs no second command.
+func callReplyStatusList(ce *commands.Event) string {
+	cfg := &ce.Bridge.Network.(*WhatsAppConnector).Config.CallAutoReply
+	var buf strings.Builder
+	buf.WriteString("Your logins:\n\n")
+	ids := ce.User.GetUserLoginIDs()
+	slices.Sort(ids)
+	for _, loginID := range ids {
+		login := ce.Bridge.GetCachedUserLoginByID(loginID)
+		if login == nil {
+			continue
+		}
+		meta, _ := login.Metadata.(*waid.UserLoginMetadata)
+		enabled, source := callReplyEnabled(cfg, meta)
+		fmt.Fprintf(&buf, "* `%s` (%s): auto-reply %s, %s\n", loginID, login.RemoteName, onOff(enabled), source)
+	}
+	return buf.String()
 }

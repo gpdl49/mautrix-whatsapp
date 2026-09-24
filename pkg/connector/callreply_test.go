@@ -23,7 +23,10 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow/types"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+
+	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
 func TestCallAutoReplyConfigPostProcess(t *testing.T) {
@@ -214,6 +217,53 @@ func TestCallRoomMemberEventsArePermitted(t *testing.T) {
 		if !seen {
 			t.Errorf("%s must be granted to members or the call cannot start", evt)
 		}
+	}
+}
+
+func TestCallReplyEnabledPerLogin(t *testing.T) {
+	for _, bridgeDefault := range []bool{false, true} {
+		cfg := &CallAutoReplyConfig{Enabled: bridgeDefault}
+		if got, src := callReplyEnabled(cfg, nil); got != bridgeDefault || src != "bridge default" {
+			t.Errorf("no metadata: got (%v, %q), want bridge default %v", got, src, bridgeDefault)
+		}
+		if got, _ := callReplyEnabled(cfg, &waid.UserLoginMetadata{CallAutoReply: &waid.CallAutoReplySettings{Message: "hi"}}); got != bridgeDefault {
+			t.Errorf("message-only override changed enabled to %v", got)
+		}
+		for _, override := range []bool{false, true} {
+			meta := &waid.UserLoginMetadata{CallAutoReply: &waid.CallAutoReplySettings{Enabled: &override}}
+			if got, src := callReplyEnabled(cfg, meta); got != override || src != "set for this login" {
+				t.Errorf("default %v, login %v: got (%v, %q)", bridgeDefault, override, got, src)
+			}
+		}
+	}
+}
+
+func TestCallInviteChatSupported(t *testing.T) {
+	tests := map[types.JID]bool{
+		types.NewJID("15550000000", types.DefaultUserServer):       true,
+		types.NewJID("123456789", types.HiddenUserServer):          true,
+		types.NewJID("120363000000000000", types.GroupServer):      true,
+		types.StatusBroadcastJID:                                   false,
+		types.NewJID("120363000000000000", types.NewsletterServer): false,
+	}
+	for jid, want := range tests {
+		if got := callInviteChatSupported(jid); got != want {
+			t.Errorf("%s: got %v, want %v", jid, got, want)
+		}
+	}
+}
+
+func TestDefaultCallInviteMessageParses(t *testing.T) {
+	cfg := CallAutoReplyConfig{}
+	if err := cfg.postProcess(); err != nil {
+		t.Fatal(err)
+	}
+	text, err := renderCallReply(cfg.inviteTemplate, callReplyTemplateData{CallLink: "https://call.example.org/abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "https://call.example.org/abc") {
+		t.Fatalf("invite text %q does not contain the link", text)
 	}
 }
 
