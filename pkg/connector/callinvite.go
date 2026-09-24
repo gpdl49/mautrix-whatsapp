@@ -102,7 +102,7 @@ func (wa *WhatsAppClient) sendCallInvite(ctx context.Context, portal *bridgev2.P
 	if chat.Server != types.GroupServer {
 		pn, lid := chat, types.EmptyJID
 		if chat.Server == types.HiddenUserServer {
-			pn, lid = types.EmptyJID, chat
+			lid = chat
 			pn, _ = wa.GetStore().LIDs.GetPNForLID(ctx, lid)
 		}
 		if name := wa.callerDisplayName(ctx, pn, lid); name != "" {
