@@ -101,6 +101,11 @@ the user's side and can overdraw the credit, but cannot be stopped. In groups "t
 everyone else combined. Settings live in portal metadata, so they are per chat and, with several
 logins, per login's chat. Setting a limit restarts it with full credit.
 
+Every limit also resets on its own every 36 hours, counted from when it was set: at each 36-hour mark the
+credit refills and only messages from then on count, so a chat where the other side went quiet does not
+stay blocked forever. The refusal notice and `show` both say when the next reset is. The period is fixed
+in code (`rateLimitResetPeriod`), not configurable per chat.
+
 ## Branches and tags
 
 | Ref | Meaning |

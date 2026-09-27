@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
@@ -42,6 +43,21 @@ import (
 // chats with long unbroken runs from one side.
 const rateLimitWindow = 200
 
+// rateLimitResetPeriod is how often every limit starts over with full credit,
+// counted from when it was set. Without it a chat the other side has gone
+// quiet in would stay blocked indefinitely.
+const rateLimitResetPeriod = 36 * time.Hour
+
+// rateLimitPeriod returns the start and end of the reset period containing
+// now. Only messages since the start count.
+func rateLimitPeriod(s *waid.RateLimitSettings, now time.Time) (start, end time.Time) {
+	start = s.EnabledAt.Time
+	if elapsed := now.Sub(start); elapsed > 0 {
+		start = start.Add(elapsed / rateLimitResetPeriod * rateLimitResetPeriod)
+	}
+	return start, start.Add(rateLimitResetPeriod)
+}
+
 // rateLimitState is the result of replaying a chat's history against its
 // settings. Credit is in units of one own message: in ratio mode a message
 // from the other side is worth Mine/Theirs of one, so the arithmetic is done
@@ -54,6 +70,8 @@ type rateLimitState struct {
 	// RepliesNeeded is how many more messages from the other side unlock the
 	// next own message; zero when one can be sent now.
 	RepliesNeeded int
+	// ResetsAt is when the current period ends and the credit refills.
+	ResetsAt time.Time
 }
 
 // replayRateLimit computes the state after a history of messages, given
@@ -105,9 +123,15 @@ func rateLimitRefusal(s *waid.RateLimitSettings, st rateLimitState) string {
 		if st.RepliesNeeded != 1 {
 			more = "messages"
 		}
-		return fmt.Sprintf("rate limit for this chat (%s). Wait for %d more %s from them.", describeRateLimit(s), st.RepliesNeeded, more)
+		return fmt.Sprintf("rate limit for this chat (%s). Wait for %d more %s from them, or until %s.",
+			describeRateLimit(s), st.RepliesNeeded, more, formatRateLimitReset(st.ResetsAt))
 	}
-	return fmt.Sprintf("rate limit for this chat (%s). Wait for a reply; you have %d unanswered.", describeRateLimit(s), st.Unanswered)
+	return fmt.Sprintf("rate limit for this chat (%s). Wait for a reply (you have %d unanswered), or until %s.",
+		describeRateLimit(s), st.Unanswered, formatRateLimitReset(st.ResetsAt))
+}
+
+func formatRateLimitReset(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04 MST")
 }
 
 func portalRateLimit(portal *bridgev2.Portal) *waid.RateLimitSettings {
@@ -119,7 +143,8 @@ func portalRateLimit(portal *bridgev2.Portal) *waid.RateLimitSettings {
 }
 
 // readRateLimitState reads the chat's recent history and replays it.
-func (wa *WhatsAppClient) readRateLimitState(ctx context.Context, portal *bridgev2.Portal, s *waid.RateLimitSettings) (rateLimitState, error) {
+func (wa *WhatsAppClient) readRateLimitState(ctx context.Context, portal *bridgev2.Portal, s *waid.RateLimitSettings, now time.Time) (rateLimitState, error) {
+	periodStart, periodEnd := rateLimitPeriod(s, now)
 	msgs, err := wa.Main.Bridge.DB.Message.GetLastNInPortal(ctx, portal.PortalKey, rateLimitWindow)
 	if err != nil {
 		return rateLimitState{}, err
@@ -132,7 +157,7 @@ func (wa *WhatsAppClient) readRateLimitState(ctx context.Context, portal *bridge
 	fromMe := make([]bool, 0, len(msgs))
 	// Newest first from the database; collect, then reverse.
 	for _, msg := range msgs {
-		if msg.Timestamp.Before(s.EnabledAt.Time) {
+		if msg.Timestamp.Before(periodStart) {
 			break
 		}
 		if msg.SenderID == "" || strings.HasPrefix(string(msg.MXID), "~fake:") {
@@ -145,7 +170,9 @@ func (wa *WhatsAppClient) readRateLimitState(ctx context.Context, portal *bridge
 		fromMe = append(fromMe, slices.Contains(own, msg.SenderID))
 	}
 	slices.Reverse(fromMe)
-	return replayRateLimit(s, fromMe), nil
+	st := replayRateLimit(s, fromMe)
+	st.ResetsAt = periodEnd
+	return st, nil
 }
 
 // checkSendLimit refuses a Matrix message that would exceed the chat's limit.
@@ -156,7 +183,7 @@ func (wa *WhatsAppClient) checkSendLimit(ctx context.Context, portal *bridgev2.P
 	if s == nil {
 		return nil
 	}
-	st, err := wa.readRateLimitState(ctx, portal, s)
+	st, err := wa.readRateLimitState(ctx, portal, s, time.Now())
 	if err != nil {
 		// Fail open: a database hiccup should not silently eat messages.
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to read history for send limit, allowing message")

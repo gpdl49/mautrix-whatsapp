@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/util/jsontime"
+
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
@@ -119,6 +121,28 @@ func TestParseRateLimitArgs(t *testing.T) {
 	} {
 		if _, err := parseRateLimitArgs(args, now); err == nil {
 			t.Fatalf("%v: expected an error", args)
+		}
+	}
+}
+
+func TestRateLimitPeriod(t *testing.T) {
+	set := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	s := &waid.RateLimitSettings{EnabledAt: jsontime.UM(set)}
+	cases := []struct {
+		now   time.Time
+		start time.Time
+	}{
+		{set, set},
+		{set.Add(35 * time.Hour), set},
+		{set.Add(36 * time.Hour), set.Add(36 * time.Hour)},
+		{set.Add(100 * time.Hour), set.Add(72 * time.Hour)},
+		// Clock skew: a now before EnabledAt stays in the first period.
+		{set.Add(-time.Minute), set},
+	}
+	for _, c := range cases {
+		start, end := rateLimitPeriod(s, c.now)
+		if !start.Equal(c.start) || !end.Equal(c.start.Add(rateLimitResetPeriod)) {
+			t.Fatalf("now=%v: got [%v, %v), want start %v", c.now, start, end, c.start)
 		}
 	}
 }

@@ -46,7 +46,8 @@ var cmdRateLimit = &commands.FullHandler{
 const rateLimitUsage = "Usage: `$cmdprefix rate-limit <show|off|reply [burst]|ratio <mine:theirs> [burst]>`\n\n" +
 	"* `reply` — you can send up to `burst` (default 1) messages, then need a reply.\n" +
 	"* `ratio 2:3` — you earn 2 messages for every 3 they send, holding at most `burst` (default the first number).\n\n" +
-	"Messages over the limit are not sent to WhatsApp and the bridge tells you why. Setting a limit starts it fresh."
+	"Messages over the limit are not sent to WhatsApp and the bridge tells you why. " +
+	"Every limit starts over with full credit every 36 hours, counted from when it was set; setting it again restarts that clock."
 
 const rateLimitMaxValue = 100
 
@@ -123,9 +124,9 @@ func fnRateLimit(ce *commands.Event) {
 			wa, _ = login.Client.(*WhatsAppClient)
 		}
 		if wa != nil {
-			if st, err := wa.readRateLimitState(ce.Ctx, ce.Portal, meta.RateLimit); err == nil {
+			if st, err := wa.readRateLimitState(ce.Ctx, ce.Portal, meta.RateLimit, time.Now()); err == nil {
 				if st.Available > 0 {
-					status = fmt.Sprintf(" You can send %d more now.", st.Available)
+					status = fmt.Sprintf(" You can send %d more now; resets %s.", st.Available, formatRateLimitReset(st.ResetsAt))
 				} else {
 					status = " Blocked: " + rateLimitRefusal(meta.RateLimit, st)
 				}

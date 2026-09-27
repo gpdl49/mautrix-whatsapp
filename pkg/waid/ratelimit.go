@@ -31,7 +31,8 @@ const (
 // Burst. Mode "ratio": each one adds Mine/Theirs credit, capped at Burst.
 // Every own message costs one credit and needs one to be sent. Only messages
 // at or after EnabledAt count, so history from before the limit was set
-// neither earns nor owes anything.
+// neither earns nor owes anything, and every 36 hours after EnabledAt the
+// credit refills and counting starts over.
 type RateLimitSettings struct {
 	Mode      string             `json:"mode"`
 	Mine      int                `json:"mine,omitempty"`
