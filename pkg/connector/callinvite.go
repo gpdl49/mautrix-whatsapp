@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -117,20 +118,21 @@ func (wa *WhatsAppClient) sendCallInvite(ctx context.Context, portal *bridgev2.P
 	if data.Name != "" {
 		roomName = "WhatsApp call with " + data.Name
 	}
-	roomID, link, err := wa.createCallRoom(ctx, roomName)
+	// Recorded for cleanup after room_ttl, which survives bridge restarts.
+	room, err := wa.createTrackedCallRoom(ctx, roomName, "")
 	if err != nil {
 		return "", err
 	}
-	data.CallLink = link
-	// The room is useless once the TTL passes, whether or not the text went out.
-	wa.scheduleCallRoomCleanup(roomID, cfg.RoomTTL)
+	data.CallLink = room.Link
 
 	text, err := renderCallReply(cfg.inviteTemplate, data)
-	if err != nil {
-		return "", err
+	var resp whatsmeow.SendResponse
+	if err == nil {
+		resp, err = wa.Client.SendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(text)})
 	}
-	resp, err := wa.Client.SendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(text)})
 	if err != nil {
+		// Nobody got the link, so the room is useless: drop it now, not after the TTL.
+		wa.Main.cleanupCallRoom(ctx, room.RoomID, wa.UserLogin.UserMXID)
 		return "", err
 	}
 
@@ -155,7 +157,7 @@ func (wa *WhatsAppClient) sendCallInvite(ctx context.Context, portal *bridgev2.P
 	if !res.Success {
 		wa.UserLogin.Log.Warn().Str("action", "call invite").Msg("Failed to mirror the call invite into the portal")
 	}
-	return link, nil
+	return room.Link, nil
 }
 
 func convertCallInviteText(_ context.Context, _ *bridgev2.Portal, _ bridgev2.MatrixAPI, text string) (*bridgev2.ConvertedMessage, error) {

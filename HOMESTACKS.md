@@ -19,12 +19,38 @@ upstream merge conflicts.
 
 A caller only gets one text per `cooldown` (default 10m) no matter how often they retry; calls are still
 declined and still produce a Matrix notice. Group calls are ignored unless `include_group_calls` is set.
+The cooldown only starts once a text has actually been sent: a failed send leaves the caller free to be
+texted on their next call, and the notice says the send failed rather than blaming the cooldown.
 
 ### Call links
 
 Element Call **never creates a room from a link**; it only joins a room whose ID is already in the
 URL fragment. So `{{.CallLink}}` is only useful if a real room exists behind it, and the bridge
 creates one per call: public, unencrypted, `history_visibility: joined`, discarded after `room_ttl`.
+A caller retrying during the cooldown is not texted again, so they get no new room either: their notice
+carries the room (and link) they were last sent, as long as it has a couple of minutes left before its
+`room_ttl` cleanup; otherwise one new room is made and reused for the rest of the cooldown. If the text
+could not be sent, the room nobody was given is deleted straight away.
+
+**State survives restarts.** Each caller's last reply and room, and every call room still waiting for its
+`room_ttl` cleanup, are kept in the bridge database in the fork's own tables (`homestacks_call_reply`,
+`homestacks_call_room`, versioned in `homestacks_callstate_version` so upstream's migrations never touch
+them). At startup the bridge reloads the cooldowns, cleans up rooms whose TTL passed while it was down, and
+reschedules the rest. A cleanup that fails because the homeserver could not be reached is retried at the
+next startup; one the homeserver refused (e.g. the bot already left) is dropped.
+
+Rooms made before this was added (fork releases up to `v0.2609.0-hs.7`) were never recorded and are not
+swept. Find them by name and creator with the Synapse admin API and delete them by hand, e.g.
+
+```sh
+# rooms named "WhatsApp call from …" / "WhatsApp call with …" / "Incoming WhatsApp call", created by the bridge bot
+curl -sH "Authorization: Bearer $ADMIN_TOKEN" \
+  "$HS/_synapse/admin/v1/rooms?search_term=WhatsApp%20call&limit=500" |
+  jq -r '.rooms[] | select(.creator == "@whatsappbot:example.org") | "\(.room_id)\t\(.name)"'
+# then, per room after checking the list:
+curl -sX DELETE -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"purge": true}' \
+  "$HS/_synapse/admin/v2/rooms/<room_id>"
+```
 
 Three things about that room are load-bearing, and each fails in a way that looks like something
 else:
@@ -134,7 +160,7 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 | Upstream file | Hook |
 |---|---|
 | `pkg/connector/client.go` | registers `handleCallAutoReply` as a second whatsmeow event handler, right after `handleWAEvent` |
-| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall` and `cmdRateLimit` to the command list |
+| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall` and `cmdRateLimit` to the command list; `startCallState` guard (an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
 | `pkg/connector/handlematrix.go` | `checkSendLimit` guard (an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart` |
 | `pkg/connector/config.go` | `CallAutoReply` field on `Config`; `postProcess()` call at the end of `PostProcess`; `upgradeCallAutoReplyConfig(helper)` in `upgradeConfig`; `call_auto_reply` block entry in `GetConfig` |
 | `pkg/connector/example-config.yaml` | `call_auto_reply:` section appended at the end |
@@ -144,12 +170,13 @@ New files:
 
 | File | Purpose |
 |---|---|
-| `pkg/connector/callreply.go` | event handler, decline + text + Matrix notice, dedupe/cooldown tracker |
-| `pkg/connector/callroom.go` | per-call Matrix room, power levels, double-puppet join, link builder, TTL cleanup |
+| `pkg/connector/callreply.go` | event handler, decline + text + Matrix notice, dedupe/cooldown tracker with per-caller room reuse |
+| `pkg/connector/callroom.go` | per-call Matrix room, power levels, double-puppet join, link builder, TTL cleanup scheduling |
+| `pkg/connector/callstate.go` | fork-owned DB tables (own version table) for cooldowns and pending call rooms; startup load and sweep |
 | `pkg/connector/callreply_config.go` | `CallAutoReplyConfig`, template parsing/validation, config upgrader |
 | `pkg/connector/callreply_command.go` | `!wa call-reply`, per-login selection and on/off resolution |
 | `pkg/connector/callinvite.go` | `!wa call`: call room + WhatsApp invite text, mirrored into the portal |
-| `pkg/connector/callreply_test.go` | unit tests for the pure parts |
+| `pkg/connector/callreply_test.go` | unit tests for the pure parts, the tracker/cooldown logic, and a SQLite round trip of `callstate.go` |
 | `pkg/waid/callreply.go` | per-login settings stored in login metadata |
 | `pkg/connector/ratelimit.go` | per-chat send limit: history replay, credit arithmetic, refusal |
 | `pkg/connector/ratelimit_command.go` | `!wa rate-limit` |
@@ -175,9 +202,12 @@ mark the config fields and the `CallLink` placeholder that go with them.
 To prepare an upstream PR, on a branch off upstream `main`:
 
 1. Take `callreply.go`, `callreply_config.go`, `callreply_command.go`,
-   `callreply_test.go` and `pkg/waid/callreply.go` as they are.
+   `callreply_test.go`, `callstate.go` and `pkg/waid/callreply.go` as they are.
 2. Delete `callroom.go`, and delete the two `call-link:` blocks in
-   `autoReplyToCall` along with the `callRoomID` variable they share.
+   `autoReplyToCall` along with the `room`/`newRoom` variables they share.
+   Drop the room fields (`RoomID`, `Link`, `RoomExpiresAt`) from
+   `callerEntry`, `reusableRoom`/`recordRoom`, and the `homestacks_call_room`
+   table and its functions from `callstate.go`; the cooldown persistence stays.
 3. Drop `CallLink` from `callReplyTemplateData`, and the four call-link fields
    (`CallLinkBaseURL`, `GuestHomeserverURL`, `ViaServers`, `RoomTTL`) from
    `CallAutoReplyConfig`, their `helper.Copy` lines, and the
@@ -186,8 +216,9 @@ To prepare an upstream PR, on a branch off upstream `main`:
    like `"Hi {{.Name}}, I can't receive WhatsApp calls on this number."`
 5. Trim `example-config.yaml` to the surviving keys: `enabled`, `message`,
    `cooldown`, `include_group_calls`.
-6. Drop `TestBuildCallLink` and `TestCallRoomMemberEventsArePermitted`, and the
-   call-link assertions in `TestCallAutoReplyConfigPostProcess`. The rest of the
+6. Drop `TestBuildCallLink`, `TestCallRoomMemberEventsArePermitted` and
+   `TestCallReplyTrackerReusesRoomDuringCooldown`, and the call-link assertions
+   in `TestCallAutoReplyConfigPostProcess` and `TestCallStateStoreRoundTrip`. The rest of the
    tests apply unchanged.
 7. Keep the `// homestacks:` hook comments out of it — rename or drop them, they
    are a marker for this fork's merge conflicts and mean nothing upstream.
@@ -216,7 +247,7 @@ git tag vX.Y.Z-hs.1 && git push origin vX.Y.Z-hs.1   # publish.yml builds the im
 
 If upstream changed something the feature relies on (`RejectCall`, `BasicCallMeta`, `QueueRemoteEvent`,
 `commands.FullHandler`, `configupgrade`, `MatrixAPI.CreateRoom`/`EnsureJoined`/`DeleteRoom`,
-`User.DoublePuppet`), the build or `go vet` step will say so; fix it in the `callreply*`/`callroom.go`
+`User.DoublePuppet`, `Bridge.GetExistingUserByMXID`, `dbutil` upgrade tables), the build or `go vet` step will say so; fix it in the `callreply*`/`callroom.go`
 files rather than in upstream code.
 
 ## Building locally
