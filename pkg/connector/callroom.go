@@ -18,9 +18,11 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -133,34 +135,120 @@ func (c *CallAutoReplyConfig) buildCallLink(roomID id.RoomID) string {
 	return c.CallLinkBaseURL + callLinkFragmentPath + "?" + q.Encode()
 }
 
+// callRoomRef is a call room as handed to a caller.
+type callRoomRef struct {
+	RoomID id.RoomID
+	Link   string
+	// ExpiresAt is when the room is cleaned up. Zero means never.
+	ExpiresAt time.Time
+}
+
+// callRoomRecord is a call room awaiting cleanup. It is stored in the bridge
+// database (callstate.go) so that a restart does not strand it.
+type callRoomRecord struct {
+	RoomID    id.RoomID
+	LoginID   string
+	UserMXID  id.UserID
+	CallerKey string // empty for `!wa call` rooms
+	ExpiresAt time.Time
+}
+
+// createTrackedCallRoom creates a call room and, if room_ttl is set, records
+// it for cleanup. callerKey ties the room to an incoming caller; pass "" for
+// rooms that belong to no caller.
+func (wa *WhatsAppClient) createTrackedCallRoom(ctx context.Context, name, callerKey string) (callRoomRef, error) {
+	roomID, link, err := wa.createCallRoom(ctx, name)
+	if err != nil {
+		return callRoomRef{}, err
+	}
+	ref := callRoomRef{RoomID: roomID, Link: link}
+	if ttl := wa.Main.Config.CallAutoReply.RoomTTL; ttl > 0 {
+		ref.ExpiresAt = time.Now().Add(ttl)
+		wa.Main.trackCallRoom(ctx, callRoomRecord{
+			RoomID:    roomID,
+			LoginID:   string(wa.UserLogin.ID),
+			UserMXID:  wa.UserLogin.UserMXID,
+			CallerKey: callerKey,
+			ExpiresAt: ref.ExpiresAt,
+		})
+	}
+	return ref, nil
+}
+
+// callRoomTimers holds a cancel func per scheduled cleanup, so that a room
+// cleaned up early (its text was never sent) does not get cleaned up twice.
+var callRoomTimers sync.Map // id.RoomID -> context.CancelFunc
+
+// trackCallRoom persists a call room and schedules its cleanup.
+func (wc *WhatsAppConnector) trackCallRoom(ctx context.Context, rec callRoomRecord) {
+	if err := callStore.insertRoom(ctx, rec); err != nil {
+		zerolog.Ctx(ctx).Err(err).Stringer("room_id", rec.RoomID).
+			Msg("Failed to store call room; it will not be cleaned up if the bridge restarts first")
+	}
+	wc.scheduleCallRoomCleanup(rec)
+}
+
 // scheduleCallRoomCleanup makes the bridge bot and the user leave the room
-// after the configured TTL, so call rooms do not accumulate. Best effort: if
-// the bridge restarts first the room is simply left behind, which is untidy
-// rather than harmful.
-func (wa *WhatsAppClient) scheduleCallRoomCleanup(roomID id.RoomID, ttl time.Duration) {
-	if ttl <= 0 {
-		return
+// once it expires, so call rooms do not accumulate. Rooms still pending when
+// the bridge stops are picked up again by startCallState.
+func (wc *WhatsAppConnector) scheduleCallRoomCleanup(rec callRoomRecord) {
+	ctx, cancel := context.WithCancel(wc.Bridge.BackgroundCtx)
+	if prev, loaded := callRoomTimers.Swap(rec.RoomID, cancel); loaded {
+		prev.(context.CancelFunc)()
 	}
 	go func() {
-		ctx := wa.Main.Bridge.BackgroundCtx
+		timer := time.NewTimer(time.Until(rec.ExpiresAt))
+		defer timer.Stop()
 		select {
-		case <-time.After(ttl):
+		case <-timer.C:
 		case <-ctx.Done():
 			return
 		}
-		log := wa.UserLogin.Log.With().
-			Str("action", "call room cleanup").
-			Stringer("room_id", roomID).
-			Logger()
-		if dp := wa.UserLogin.User.DoublePuppet(ctx); dp != nil {
-			if err := dp.DeleteRoom(ctx, roomID, false); err != nil {
-				log.Debug().Err(err).Msg("Failed to remove the user from the expired call room")
+		wc.cleanupCallRoom(ctx, rec.RoomID, rec.UserMXID)
+	}()
+}
+
+// cleanupCallRoom removes the user (through their double puppet) and the
+// bridge bot from a call room and forgets it. If the homeserver could not be
+// reached the record is kept and retried at the next startup.
+func (wc *WhatsAppConnector) cleanupCallRoom(ctx context.Context, roomID id.RoomID, userMXID id.UserID) {
+	if cancel, ok := callRoomTimers.LoadAndDelete(roomID); ok {
+		cancel.(context.CancelFunc)()
+	}
+	// The timer's own context was just cancelled; do the work on a live one.
+	ctx = context.WithoutCancel(ctx)
+	log := wc.Bridge.Log.With().
+		Str("action", "call room cleanup").
+		Stringer("room_id", roomID).
+		Logger()
+	if userMXID != "" {
+		if user, err := wc.Bridge.GetExistingUserByMXID(ctx, userMXID); err != nil {
+			log.Debug().Err(err).Msg("Failed to look up the call room's user")
+		} else if user != nil {
+			if dp := user.DoublePuppet(ctx); dp != nil {
+				if err = dp.DeleteRoom(ctx, roomID, false); err != nil {
+					log.Debug().Err(err).Msg("Failed to remove the user from the expired call room")
+				}
 			}
 		}
-		if err := wa.Main.Bridge.Bot.DeleteRoom(ctx, roomID, false); err != nil {
-			log.Debug().Err(err).Msg("Failed to clean up the expired call room")
-		} else {
-			log.Debug().Msg("Cleaned up expired call room")
-		}
-	}()
+	}
+	if err := wc.Bridge.Bot.DeleteRoom(ctx, roomID, false); err != nil && !isPermanentMatrixError(err) {
+		log.Warn().Err(err).Msg("Failed to clean up the call room; will retry at the next startup")
+		return
+	} else if err != nil {
+		log.Debug().Err(err).Msg("Call room is already gone")
+	} else {
+		log.Debug().Msg("Cleaned up call room")
+	}
+	if err := callStore.deleteRoom(ctx, roomID); err != nil {
+		log.Err(err).Msg("Failed to forget cleaned up call room")
+	}
+}
+
+// isPermanentMatrixError reports whether retrying err is pointless: the
+// homeserver answered, and said no (e.g. the bot is no longer in the room).
+func isPermanentMatrixError(err error) bool {
+	var httpErr mautrix.HTTPError
+	return errors.As(err, &httpErr) && httpErr.Response != nil &&
+		httpErr.Response.StatusCode >= 400 && httpErr.Response.StatusCode < 500
 }

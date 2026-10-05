@@ -19,10 +19,13 @@ package connector
 import (
 	"context"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"go.mau.fi/util/dbutil"
+	_ "go.mau.fi/util/dbutil/litestream" // registers sqlite3-fk-wal, as the bridge itself uses
 	"go.mau.fi/whatsmeow/types"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
@@ -90,7 +93,7 @@ func TestRenderCallReply(t *testing.T) {
 }
 
 func TestCallReplyTrackerDedupesCalls(t *testing.T) {
-	tr := &callReplyTracker{seenCalls: map[string]time.Time{}, lastReply: map[string]time.Time{}}
+	tr := newCallReplyTracker()
 	now := time.Now()
 	if !tr.markCall(now, "login", "call-1") {
 		t.Error("first sighting of a call should be handled")
@@ -101,29 +104,191 @@ func TestCallReplyTrackerDedupesCalls(t *testing.T) {
 	if !tr.markCall(now, "other-login", "call-1") {
 		t.Error("call IDs are scoped per login")
 	}
-	if !tr.markCall(now.Add(2*callReplyTrackerRetention), "login", "call-1") {
+	if !tr.markCall(now.Add(2*callSeenRetention), "login", "call-1") {
 		t.Error("entries should be pruned after the retention period")
 	}
 }
 
 func TestCallReplyTrackerCooldown(t *testing.T) {
-	tr := &callReplyTracker{seenCalls: map[string]time.Time{}, lastReply: map[string]time.Time{}}
+	tr := newCallReplyTracker()
 	now := time.Now()
 	const cooldown = 10 * time.Minute
-	if !tr.markReply(now, "login", "caller", cooldown) {
-		t.Error("first reply should be sent")
+	caller := callerKey{LoginID: "login", Caller: "caller"}
+	if tr.inCooldown(now, caller, cooldown) {
+		t.Error("first call should be outside the cooldown")
 	}
-	if tr.markReply(now.Add(time.Minute), "login", "caller", cooldown) {
+	if tr.inCooldown(now, caller, cooldown) {
+		t.Error("checking the cooldown must not start it")
+	}
+	tr.recordReply(now, caller, cooldown, callRoomRef{})
+	if !tr.inCooldown(now.Add(time.Minute), caller, cooldown) {
 		t.Error("retry within the cooldown must not get another text")
 	}
-	if !tr.markReply(now.Add(time.Minute), "login", "someone-else", cooldown) {
+	if tr.inCooldown(now.Add(time.Minute), callerKey{LoginID: "login", Caller: "someone-else"}, cooldown) {
 		t.Error("cooldown is per caller")
 	}
-	if !tr.markReply(now.Add(cooldown+time.Second), "login", "caller", cooldown) {
+	if tr.inCooldown(now.Add(time.Minute), callerKey{LoginID: "other-login", Caller: "caller"}, cooldown) {
+		t.Error("cooldown is per login")
+	}
+	if tr.inCooldown(now.Add(cooldown+time.Second), caller, cooldown) {
 		t.Error("reply should be sent again after the cooldown")
 	}
-	if !tr.markReply(now, "login", "caller", 0) {
+	if tr.inCooldown(now.Add(time.Minute), caller, 0) {
 		t.Error("zero cooldown disables rate limiting")
+	}
+}
+
+// A send that fails never calls recordReply, so it must leave the caller free
+// to be texted on their next call.
+func TestCallReplyTrackerFailedSendDoesNotStartCooldown(t *testing.T) {
+	tr := newCallReplyTracker()
+	now := time.Now()
+	caller := callerKey{LoginID: "login", Caller: "caller"}
+	_ = tr.inCooldown(now, caller, time.Hour)
+	if tr.inCooldown(now.Add(time.Second), caller, time.Hour) {
+		t.Error("a call whose text was never sent must not put the caller in the cooldown")
+	}
+}
+
+func TestCallReplyTrackerReusesRoomDuringCooldown(t *testing.T) {
+	tr := newCallReplyTracker()
+	now := time.Now()
+	const cooldown = 10 * time.Minute
+	caller := callerKey{LoginID: "login", Caller: "caller"}
+	if _, _, ok := tr.reusableRoom(now, caller); ok {
+		t.Fatal("no room before the first call")
+	}
+	room := callRoomRef{RoomID: "!a:example.org", Link: "https://call.example.org/a", ExpiresAt: now.Add(time.Hour)}
+	tr.recordReply(now, caller, cooldown, room)
+	roomID, link, ok := tr.reusableRoom(now.Add(time.Minute), caller)
+	if !ok || roomID != room.RoomID || link != room.Link {
+		t.Errorf("retry during the cooldown should reuse the room, got %q %q %v", roomID, link, ok)
+	}
+	if _, _, ok = tr.reusableRoom(now.Add(time.Hour-callRoomReuseMargin/2), caller); ok {
+		t.Error("a room about to be cleaned up must not be handed out again")
+	}
+
+	// A room created during the cooldown (the previous one was gone) is
+	// remembered without restarting the cooldown.
+	tr2 := newCallReplyTracker()
+	tr2.recordReply(now, caller, cooldown, callRoomRef{})
+	later := callRoomRef{RoomID: "!b:example.org", Link: "https://call.example.org/b", ExpiresAt: now.Add(2 * time.Hour)}
+	e := tr2.recordRoom(caller, cooldown, later)
+	if !e.LastReply.Equal(now) {
+		t.Errorf("recordRoom must not touch LastReply: %v", e.LastReply)
+	}
+	if !e.ExpiresAt.Equal(later.ExpiresAt) {
+		t.Errorf("entry should live as long as its room: %v", e.ExpiresAt)
+	}
+	if roomID, _, _ = tr2.reusableRoom(now.Add(time.Minute), caller); roomID != later.RoomID {
+		t.Errorf("expected the newer room, got %q", roomID)
+	}
+}
+
+// The tracker used to prune every entry after a fixed hour, so a cooldown
+// longer than that was silently cut short.
+func TestCallReplyTrackerPrunesByEntryExpiry(t *testing.T) {
+	tr := newCallReplyTracker()
+	now := time.Now()
+	const cooldown = 3 * time.Hour
+	caller := callerKey{LoginID: "login", Caller: "caller"}
+	tr.recordReply(now, caller, cooldown, callRoomRef{})
+	// markCall prunes.
+	tr.markCall(now.Add(2*time.Hour), "login", "call-x")
+	if !tr.inCooldown(now.Add(2*time.Hour), caller, cooldown) {
+		t.Error("cooldown longer than an hour must survive pruning")
+	}
+	tr.markCall(now.Add(cooldown+time.Minute), "login", "call-y")
+	if _, ok := tr.callers[caller]; ok {
+		t.Error("entry should be pruned once both the cooldown and the room have expired")
+	}
+
+	// A room outliving the cooldown keeps the entry (and the room) around.
+	tr = newCallReplyTracker()
+	room := callRoomRef{RoomID: "!a:example.org", Link: "l", ExpiresAt: now.Add(5 * time.Hour)}
+	tr.recordReply(now, caller, time.Minute, room)
+	tr.markCall(now.Add(4*time.Hour), "login", "call-z")
+	if _, ok := tr.callers[caller]; !ok {
+		t.Error("entry must be kept while its room is alive")
+	}
+}
+
+func TestCallStateStoreRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	raw, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "state.db")+"?_txlock=immediate", "sqlite3-fk-wal")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer raw.Close()
+	db := raw.Child(callStateVersionTable, callStateUpgrades, nil)
+	if err = db.Upgrade(ctx); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	s := &callStateStore{db: db, bridgeID: "wa"}
+	other := &callStateStore{db: db, bridgeID: "other-bridge"}
+	now := time.UnixMilli(time.Now().UnixMilli())
+
+	live := callerKey{LoginID: "login", Caller: "15550000001@s.whatsapp.net"}
+	dead := callerKey{LoginID: "login", Caller: "15550000002@s.whatsapp.net"}
+	liveEntry := callerEntry{
+		LastReply: now, RoomID: "!a:example.org", Link: "https://call.example.org/a",
+		RoomExpiresAt: now.Add(time.Hour), ExpiresAt: now.Add(time.Hour),
+	}
+	for key, e := range map[callerKey]callerEntry{
+		live: {LastReply: now.Add(-time.Minute), ExpiresAt: now.Add(time.Minute)},
+		dead: {LastReply: now.Add(-time.Hour), ExpiresAt: now.Add(-time.Minute)},
+	} {
+		if err = s.upsertCaller(ctx, key, e); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+	// Upsert overwrites.
+	if err = s.upsertCaller(ctx, live, liveEntry); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err = other.upsertCaller(ctx, live, liveEntry); err != nil {
+		t.Fatalf("upsert other: %v", err)
+	}
+	callers, err := s.loadCallers(ctx, now)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(callers) != 1 {
+		t.Fatalf("expected only the live caller, got %v", callers)
+	}
+	if got := callers[live]; got != liveEntry {
+		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", got, liveEntry)
+	}
+
+	rec := callRoomRecord{RoomID: "!a:example.org", LoginID: "login", UserMXID: "@u:example.org", CallerKey: live.Caller, ExpiresAt: now.Add(time.Hour)}
+	if err = s.insertRoom(ctx, rec); err != nil {
+		t.Fatalf("insert room: %v", err)
+	}
+	if err = s.insertRoom(ctx, callRoomRecord{RoomID: "!b:example.org", LoginID: "login", ExpiresAt: now}); err != nil {
+		t.Fatalf("insert room: %v", err)
+	}
+	rooms, err := s.loadRooms(ctx)
+	if err != nil || len(rooms) != 2 {
+		t.Fatalf("load rooms: %v %v", rooms, err)
+	}
+	if err = s.deleteRoom(ctx, "!b:example.org"); err != nil {
+		t.Fatalf("delete room: %v", err)
+	}
+	rooms, _ = s.loadRooms(ctx)
+	if len(rooms) != 1 || rooms[0] != rec {
+		t.Errorf("unexpected rooms after delete: %+v", rooms)
+	}
+	if rooms, _ = other.loadRooms(ctx); len(rooms) != 0 {
+		t.Errorf("rooms are scoped per bridge: %+v", rooms)
+	}
+
+	// A nil store (no database) is a silent no-op.
+	var none *callStateStore
+	if err = none.upsertCaller(ctx, live, liveEntry); err != nil {
+		t.Error(err)
+	}
+	if err = none.insertRoom(ctx, rec); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -131,7 +296,7 @@ func TestConvertCallReplyNotice(t *testing.T) {
 	msg, err := convertCallReplyNotice(context.Background(), nil, nil, callReplyNotice{
 		Data:      callReplyTemplateData{Name: "Ada <3", CallType: "audio", CallLink: "https://call.example.org/abc"},
 		ReplyText: "see you there",
-		Sent:      true,
+		Status:    callReplySent,
 	})
 	if err != nil {
 		t.Fatalf("convert: %v", err)
@@ -149,10 +314,17 @@ func TestConvertCallReplyNotice(t *testing.T) {
 		t.Errorf("link should be clickable: %q", content.FormattedBody)
 	}
 
-	msg, _ = convertCallReplyNotice(context.Background(), nil, nil, callReplyNotice{Data: callReplyTemplateData{}})
+	msg, _ = convertCallReplyNotice(context.Background(), nil, nil, callReplyNotice{Status: callReplyCooldown})
 	body := msg.Parts[0].Content.Body
 	if !strings.Contains(body, "unknown caller") || !strings.Contains(body, "cooldown") {
 		t.Errorf("unexpected fallback body: %q", body)
+	}
+
+	// A failed send must not be reported as a cooldown.
+	msg, _ = convertCallReplyNotice(context.Background(), nil, nil, callReplyNotice{Status: callReplyFailed})
+	body = msg.Parts[0].Content.Body
+	if strings.Contains(body, "cooldown") || !strings.Contains(body, "failed") {
+		t.Errorf("failed send should say so: %q", body)
 	}
 }
 

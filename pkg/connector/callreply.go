@@ -43,22 +43,63 @@ import (
 // as a second whatsmeow event handler next to handleWAEvent so that the
 // upstream call handling stays untouched. See HOMESTACKS.md.
 
-// callReplyTracker remembers which calls were already handled and when each
-// caller last received an auto-reply, so that CallOffer + CallOfferNotice for
-// one call, or a caller retrying three times in a row, produce a single text.
-// One instance is shared by all logins; keys are prefixed with the login ID.
+// callReplyTracker remembers which calls were already handled and, per caller,
+// when they last received an auto-reply and which call room they were sent.
+// That way CallOffer + CallOfferNotice for one call, or a caller retrying three
+// times in a row, produce a single text and a single room. One instance is
+// shared by all logins; entries are keyed by login ID and caller.
+//
+// The tracker itself is pure and in-memory; callstate.go loads it from and
+// writes it through to the bridge database so cooldowns survive restarts.
 type callReplyTracker struct {
 	lock      sync.Mutex
 	seenCalls map[string]time.Time
-	lastReply map[string]time.Time
+	callers   map[callerKey]callerEntry
 	lastPrune time.Time
 }
 
-const callReplyTrackerRetention = time.Hour
+// callerKey identifies a caller as seen by one login. Caller is the phone
+// number JID, or the LID when no phone number is known.
+type callerKey struct {
+	LoginID string
+	Caller  string
+}
 
-var callReplies = &callReplyTracker{
-	seenCalls: make(map[string]time.Time),
-	lastReply: make(map[string]time.Time),
+// callerEntry is what the tracker knows about one caller.
+type callerEntry struct {
+	// LastReply is when the caller was last actually texted. Zero if they
+	// never were (e.g. a room was created during a cooldown that predates the
+	// tracker, or the bridge was restarted from an older version).
+	LastReply time.Time
+	// RoomID and Link are the call room the caller was most recently sent,
+	// reused for further calls during the cooldown so that a caller retrying
+	// does not get a fresh room each time. Empty without call links.
+	RoomID id.RoomID
+	Link   string
+	// RoomExpiresAt is when the room is cleaned up. Zero means never.
+	RoomExpiresAt time.Time
+	// ExpiresAt is when the entry stops mattering: the cooldown has run out
+	// and the room is gone. Entries are pruned after it.
+	ExpiresAt time.Time
+}
+
+// callSeenRetention is how long a call ID is remembered for dedupe. Call
+// events older than callEventMaxAge are ignored anyway, so this only needs to
+// be comfortably longer than that.
+const callSeenRetention = time.Hour
+
+// callRoomReuseMargin is how much life a call room must have left to be handed
+// to a caller again. A link to a room that is cleaned up seconds later is
+// worse than a fresh one.
+const callRoomReuseMargin = 2 * time.Minute
+
+var callReplies = newCallReplyTracker()
+
+func newCallReplyTracker() *callReplyTracker {
+	return &callReplyTracker{
+		seenCalls: make(map[string]time.Time),
+		callers:   make(map[callerKey]callerEntry),
+	}
 }
 
 // markCall records a call and reports whether it is new.
@@ -74,32 +115,93 @@ func (t *callReplyTracker) markCall(now time.Time, loginID, callID string) bool 
 	return true
 }
 
-// markReply records that a reply is being sent to caller and reports whether
-// the caller is outside the cooldown window.
-func (t *callReplyTracker) markReply(now time.Time, loginID, caller string, cooldown time.Duration) bool {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-	key := loginID + "/" + caller
-	if last, ok := t.lastReply[key]; ok && cooldown > 0 && now.Sub(last) < cooldown {
+// inCooldown reports whether the caller was texted less than cooldown ago.
+// It does not change anything: the cooldown only starts once a text has
+// actually gone out (see recordReply).
+func (t *callReplyTracker) inCooldown(now time.Time, key callerKey, cooldown time.Duration) bool {
+	if cooldown <= 0 {
 		return false
 	}
-	t.lastReply[key] = now
-	return true
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	e, ok := t.callers[key]
+	return ok && !e.LastReply.IsZero() && now.Sub(e.LastReply) < cooldown
+}
+
+// reusableRoom returns the caller's last call room if it is still around for
+// long enough to be worth handing out again.
+func (t *callReplyTracker) reusableRoom(now time.Time, key callerKey) (id.RoomID, string, bool) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	e, ok := t.callers[key]
+	if !ok || e.RoomID == "" || e.Link == "" {
+		return "", "", false
+	}
+	if !e.RoomExpiresAt.IsZero() && e.RoomExpiresAt.Sub(now) < callRoomReuseMargin {
+		return "", "", false
+	}
+	return e.RoomID, e.Link, true
+}
+
+// recordReply starts the caller's cooldown, and remembers the room they were
+// sent (if any). Call it only once the text has actually been sent. It
+// returns the updated entry so that it can be persisted.
+func (t *callReplyTracker) recordReply(now time.Time, key callerKey, cooldown time.Duration, room callRoomRef) callerEntry {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	e := callerEntry{LastReply: now}
+	e.setRoom(room)
+	e.ExpiresAt = e.expiry(cooldown)
+	t.callers[key] = e
+	return e
+}
+
+// recordRoom remembers a room handed to a caller without texting them (a
+// call during the cooldown whose previous room was already gone), leaving
+// the cooldown as it was.
+func (t *callReplyTracker) recordRoom(key callerKey, cooldown time.Duration, room callRoomRef) callerEntry {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	e := t.callers[key]
+	e.setRoom(room)
+	e.ExpiresAt = e.expiry(cooldown)
+	t.callers[key] = e
+	return e
+}
+
+// load replaces the entry for key, e.g. from the database at startup.
+func (t *callReplyTracker) load(key callerKey, e callerEntry) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	t.callers[key] = e
+}
+
+func (e *callerEntry) setRoom(room callRoomRef) {
+	e.RoomID, e.Link, e.RoomExpiresAt = room.RoomID, room.Link, room.ExpiresAt
+}
+
+// expiry is the later of the end of the cooldown and the room's cleanup.
+func (e *callerEntry) expiry(cooldown time.Duration) time.Time {
+	exp := e.LastReply.Add(max(cooldown, 0))
+	if e.RoomExpiresAt.After(exp) {
+		exp = e.RoomExpiresAt
+	}
+	return exp
 }
 
 func (t *callReplyTracker) pruneLocked(now time.Time) {
-	if now.Sub(t.lastPrune) < callReplyTrackerRetention/4 {
+	if now.Sub(t.lastPrune) < callSeenRetention/4 {
 		return
 	}
 	t.lastPrune = now
 	for key, ts := range t.seenCalls {
-		if now.Sub(ts) > callReplyTrackerRetention {
+		if now.Sub(ts) > callSeenRetention {
 			delete(t.seenCalls, key)
 		}
 	}
-	for key, ts := range t.lastReply {
-		if now.Sub(ts) > callReplyTrackerRetention {
-			delete(t.lastReply, key)
+	for key, e := range t.callers {
+		if !now.Before(e.ExpiresAt) {
+			delete(t.callers, key)
 		}
 	}
 }
@@ -201,32 +303,53 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 		data.Name = data.Phone
 	}
 
-	// call-link: create the room the caller will be sent to. Element Call only
-	// ever joins a room that already exists, so the link is worthless without
-	// this. Everything behind this seam lives in callroom.go and is the part of
-	// the fork that is NOT upstreamable -- see "Upstreaming" in HOMESTACKS.md.
-	var callRoomID id.RoomID
-	if wa.Main.Config.CallAutoReply.CallLinkBaseURL != "" {
-		var err error
-		roomName := "Incoming WhatsApp call"
-		if data.Name != "" {
-			roomName = "WhatsApp call from " + data.Name
+	cfg := &wa.Main.Config.CallAutoReply
+	key := callerKey{LoginID: string(wa.UserLogin.ID), Caller: cooldownKey}
+	// Check the cooldown before anything else: a caller retrying during it
+	// gets neither another text nor another room.
+	cooling := callReplies.inCooldown(time.Now(), key, cfg.Cooldown)
+
+	// call-link: find or create the room the caller will be sent to. Element
+	// Call only ever joins a room that already exists, so the link is worthless
+	// without this. Everything behind this seam lives in callroom.go and
+	// callstate.go and is the part of the fork that is NOT upstreamable -- see
+	// "Upstreaming" in HOMESTACKS.md.
+	var room callRoomRef
+	newRoom := false
+	if cfg.CallLinkBaseURL != "" {
+		if roomID, link, ok := callReplies.reusableRoom(time.Now(), key); cooling && ok {
+			room = callRoomRef{RoomID: roomID, Link: link}
+			log.Debug().Stringer("room_id", roomID).Msg("Caller is within the cooldown, reusing their call room")
+		} else {
+			roomName := "Incoming WhatsApp call"
+			if data.Name != "" {
+				roomName = "WhatsApp call from " + data.Name
+			}
+			var err error
+			room, err = wa.createTrackedCallRoom(ctx, roomName, cooldownKey)
+			if err != nil {
+				// Send the text anyway: a caller being told "I can't take
+				// WhatsApp calls" without a link is still better than silence.
+				log.Err(err).Msg("Failed to create the call room; replying without a link")
+			} else {
+				newRoom = true
+				if cooling {
+					// Remember it so the caller's next retry reuses it.
+					wa.Main.saveCaller(ctx, key, callReplies.recordRoom(key, cfg.Cooldown, room))
+				}
+			}
 		}
-		callRoomID, data.CallLink, err = wa.createCallRoom(ctx, roomName)
-		if err != nil {
-			// Send the text anyway: a caller being told "I can't take WhatsApp
-			// calls" without a link is still better than silence.
-			log.Err(err).Msg("Failed to create the call room; replying without a link")
-		}
+		data.CallLink = room.Link
 	}
 
 	var replyText string
-	sent := false
-	if callReplies.markReply(time.Now(), string(wa.UserLogin.ID), cooldownKey, wa.Main.Config.CallAutoReply.Cooldown) {
+	status := callReplyCooldown
+	if !cooling {
+		status = callReplyFailed
 		tmpl, err := parseCallReplyTemplate(message)
 		if err != nil {
 			log.Err(err).Msg("Invalid call auto-reply template, falling back to bridge config")
-			tmpl = wa.Main.Config.CallAutoReply.messageTemplate
+			tmpl = cfg.messageTemplate
 		}
 		replyText, err = renderCallReply(tmpl, data)
 		if err != nil {
@@ -234,8 +357,15 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 		} else if _, err = wa.Client.SendMessage(ctx, dm, &waE2E.Message{Conversation: proto.String(replyText)}); err != nil {
 			log.Err(err).Msg("Failed to send call auto-reply")
 		} else {
-			sent = true
+			status = callReplySent
 			log.Info().Msg("Sent call auto-reply")
+			// Only a text that actually went out starts the cooldown.
+			wa.Main.saveCaller(ctx, key, callReplies.recordReply(time.Now(), key, cfg.Cooldown, room))
+		}
+		if status != callReplySent && newRoom {
+			// call-link: nobody was given the link, so the room is useless.
+			wa.Main.cleanupCallRoom(ctx, room.RoomID, wa.UserLogin.UserMXID)
+			data.CallLink = ""
 		}
 	} else {
 		log.Debug().Msg("Caller is within the auto-reply cooldown, not sending another text")
@@ -255,17 +385,11 @@ func (wa *WhatsAppClient) autoReplyToCall(ctx context.Context, meta types.BasicC
 			StreamOrder:  time.Now().Unix(),
 		},
 		ID:                 waid.MakeFakeMessageID(chat, dm, "call-reply-"+meta.CallID),
-		Data:               callReplyNotice{Data: data, ReplyText: replyText, Sent: sent},
+		Data:               callReplyNotice{Data: data, ReplyText: replyText, Status: status},
 		ConvertMessageFunc: convertCallReplyNotice,
 	})
 	if !res.Success {
 		log.Warn().Msg("Failed to queue call auto-reply notice to Matrix")
-	}
-
-	// call-link: call rooms are per-call and disposable; drop this one after the
-	// TTL so they do not accumulate one per missed call forever.
-	if callRoomID != "" {
-		wa.scheduleCallRoomCleanup(callRoomID, wa.Main.Config.CallAutoReply.RoomTTL)
 	}
 }
 
@@ -289,10 +413,21 @@ func (wa *WhatsAppClient) callerDisplayName(ctx context.Context, pn, lid types.J
 	return ""
 }
 
+// callReplyStatus says what happened to the text for one call.
+type callReplyStatus int
+
+const (
+	callReplySent callReplyStatus = iota
+	// The caller was already texted within the cooldown.
+	callReplyCooldown
+	// Rendering or sending the text failed; the cooldown was not started.
+	callReplyFailed
+)
+
 type callReplyNotice struct {
 	Data      callReplyTemplateData
 	ReplyText string
-	Sent      bool
+	Status    callReplyStatus
 }
 
 func convertCallReplyNotice(_ context.Context, _ *bridgev2.Portal, _ bridgev2.MatrixAPI, n callReplyNotice) (*bridgev2.ConvertedMessage, error) {
@@ -307,12 +442,16 @@ func convertCallReplyNotice(_ context.Context, _ *bridgev2.Portal, _ bridgev2.Ma
 	var body, formatted strings.Builder
 	fmt.Fprintf(&body, "Declined incoming WhatsApp %s from %s.", callWord, who)
 	fmt.Fprintf(&formatted, "Declined incoming WhatsApp %s from <b>%s</b>.", html.EscapeString(callWord), html.EscapeString(who))
-	if n.Sent {
+	switch n.Status {
+	case callReplySent:
 		fmt.Fprintf(&body, " Sent them: “%s”", n.ReplyText)
 		fmt.Fprintf(&formatted, " Sent them: <i>“%s”</i>", html.EscapeString(n.ReplyText))
-	} else {
-		body.WriteString(" No text was sent (cooldown).")
-		formatted.WriteString(" No text was sent (cooldown).")
+	case callReplyCooldown:
+		body.WriteString(" No text was sent: they were already texted recently (cooldown).")
+		formatted.WriteString(" No text was sent: they were already texted recently (cooldown).")
+	default:
+		body.WriteString(" Texting them failed; see the bridge log.")
+		formatted.WriteString(" Texting them failed; see the bridge log.")
 	}
 	if n.Data.CallLink != "" {
 		fmt.Fprintf(&body, "\nJoin the call: %s", n.Data.CallLink)

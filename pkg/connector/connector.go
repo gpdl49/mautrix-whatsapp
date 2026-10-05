@@ -160,6 +160,9 @@ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
 	if err != nil {
 		return bridgev2.DBUpgradeError{Err: err, Section: "whatsapp"}
 	}
+	if err = wa.startCallState(ctx); err != nil { // homestacks: call auto-reply state
+		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_callstate"}
+	}
 
 	err = wa.migrateToLIDDMs(ctx)
 	if err != nil {
