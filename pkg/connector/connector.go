@@ -112,6 +112,7 @@ func (wa *WhatsAppConnector) Init(bridge *bridgev2.Bridge) {
 	wa.Bridge.Commands.(*commands.Processor).AddHandlers(
 		cmdAccept, cmdSync, cmdInviteLink, cmdResolveLink, cmdJoin,
 		cmdCallReply, cmdCall, cmdRateLimit, // homestacks: call auto-reply, outgoing call invites, per-chat send limit
+		cmdSchedule, cmdOfflineHours, cmdTimezone, // homestacks: held messages
 	)
 	wa.mediaEditCache = make(MediaEditCache)
 	wa.unmigratedDMs = exsync.NewSet[networkid.PortalKey]()
@@ -162,6 +163,9 @@ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
 	}
 	if err = wa.startCallState(ctx); err != nil { // homestacks: call auto-reply state
 		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_callstate"}
+	}
+	if err = wa.startHeldMessages(ctx); err != nil { // homestacks: held messages
+		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_heldmsg"}
 	}
 
 	err = wa.migrateToLIDDMs(ctx)

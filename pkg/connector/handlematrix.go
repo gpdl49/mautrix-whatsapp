@@ -67,6 +67,9 @@ var (
 )
 
 func (wa *WhatsAppClient) HandleMatrixPollStart(ctx context.Context, msg *bridgev2.MatrixPollStart) (result *bridgev2.MatrixMessageResponse, retErr error) {
+	if err := wa.checkHold(ctx, &msg.MatrixMessage); err != nil { // homestacks: held messages
+		return nil, err
+	}
 	if err := wa.checkSendLimit(ctx, msg.Portal); err != nil { // homestacks: per-chat send limit
 		return nil, err
 	}
@@ -99,6 +102,9 @@ func (wa *WhatsAppClient) HandleMatrixPollVote(ctx context.Context, msg *bridgev
 }
 
 func (wa *WhatsAppClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (result *bridgev2.MatrixMessageResponse, retErr error) {
+	if err := wa.checkHold(ctx, msg); err != nil { // homestacks: held messages
+		return nil, err
+	}
 	if err := wa.checkSendLimit(ctx, msg.Portal); err != nil { // homestacks: per-chat send limit
 		return nil, err
 	}

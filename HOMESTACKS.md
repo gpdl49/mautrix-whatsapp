@@ -132,6 +132,37 @@ credit refills and only messages from then on count, so a chat where the other s
 stay blocked forever. The refusal notice and `show` both say when the next reset is. The period is fixed
 in code (`rateLimitResetPeriod`), not configurable per chat.
 
+**Held messages: scheduling and offline hours.** Matrix messages the bridge keeps back and sends to
+WhatsApp later, managed from the chat's own room:
+
+```
+!wa schedule 18:30                 # hold your next message here (within 10 min) until 18:30
+!wa schedule +45m Running late     # send this text in 45 minutes (also `in 45m`, `6:30pm`, `7am`)
+!wa schedule list | now [n|all] | cancel [n|all]
+!wa offline-hours 22:00-08:00      # messages sent 22:00–08:00 wait until 08:00
+!wa offline-hours show | off
+!wa timezone Europe/London         # zone for both; sets it on all your logins
+```
+
+Times are a time of day (the next time the clock reads it) or a `+` delay, at most 24 hours ahead. A
+held message gets a ⏰ reaction from the bot, which is removed when it is sent; the first message of an
+offline-hours batch also gets a notice. Messages sent while an offline batch is still waiting join it,
+even just after the window ends, so the chat never sees them out of order. An explicit schedule wins over
+offline hours. Any message type is held — media, polls, replies — but edits are not: edit a held message
+and the edit fails, so delete it and send again. **Deleting a held message in Matrix cancels it**; the
+bridge checks for a redaction just before sending.
+
+How: `checkHold` refuses the message with a `PENDING` status before it is converted (so nothing is
+uploaded) and stores the decrypted event in `homestacks_held_message`. Every 15s due rows are deleted and
+the same event is queued back into the bridge with `Bridge.QueueMatrixEvent`; `checkHold` lets it through
+once. The WhatsApp message therefore maps to the original Matrix event, and the per-chat send limit
+applies at send time, not hold time. With inline text the command event itself becomes the message.
+Rows wait while their login is disconnected (the whole room, to keep order) and are dropped if the
+login is deleted. Arming a bare `!wa schedule <time>` is in memory only and lost on restart.
+
+The timezone is upstream's `UserLoginMetadata.Timezone` (also used for local-time media requests),
+falling back to the bridge's local zone (UTC in the image). Offline hours live in portal metadata.
+
 ## Branches and tags
 
 | Ref | Meaning |
@@ -160,11 +191,11 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 | Upstream file | Hook |
 |---|---|
 | `pkg/connector/client.go` | registers `handleCallAutoReply` as a second whatsmeow event handler, right after `handleWAEvent` |
-| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall` and `cmdRateLimit` to the command list; `startCallState` guard (an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
-| `pkg/connector/handlematrix.go` | `checkSendLimit` guard (an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart` |
+| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall`, `cmdRateLimit` and (on a second line) `cmdSchedule`, `cmdOfflineHours`, `cmdTimezone` to the command list; `startCallState` and `startHeldMessages` guards (each an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
+| `pkg/connector/handlematrix.go` | `checkHold` then `checkSendLimit` guards (each an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart` |
 | `pkg/connector/config.go` | `CallAutoReply` field on `Config`; `postProcess()` call at the end of `PostProcess`; `upgradeCallAutoReplyConfig(helper)` in `upgradeConfig`; `call_auto_reply` block entry in `GetConfig` |
 | `pkg/connector/example-config.yaml` | `call_auto_reply:` section appended at the end |
-| `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata`; `RateLimit` field on `PortalMetadata` |
+| `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata`; `RateLimit` and `OfflineHours` fields on `PortalMetadata` |
 
 New files:
 
@@ -182,6 +213,10 @@ New files:
 | `pkg/connector/ratelimit_command.go` | `!wa rate-limit` |
 | `pkg/connector/ratelimit_test.go` | unit tests for the replay and argument parsing |
 | `pkg/waid/ratelimit.go` | per-chat settings stored in portal metadata |
+| `pkg/connector/heldmsg.go` | held messages: hold guard, `homestacks_held_message` table, release loop, time parsing |
+| `pkg/connector/heldmsg_command.go` | `!wa schedule`, `!wa offline-hours`, `!wa timezone` |
+| `pkg/connector/heldmsg_test.go` | unit tests for time parsing, offline windows and the event round trip |
+| `pkg/waid/offlinehours.go` | per-chat offline hours stored in portal metadata |
 
 ## Upstreaming
 
@@ -245,7 +280,7 @@ git push origin homestacks
 git tag vX.Y.Z-hs.1 && git push origin vX.Y.Z-hs.1   # publish.yml builds the image
 ```
 
-If upstream changed something the feature relies on (`RejectCall`, `BasicCallMeta`, `QueueRemoteEvent`,
+If upstream changed something a feature relies on (`QueueMatrixEvent`, `matrix.ASIntent`, `RejectCall`, `BasicCallMeta`, `QueueRemoteEvent`,
 `commands.FullHandler`, `configupgrade`, `MatrixAPI.CreateRoom`/`EnsureJoined`/`DeleteRoom`,
 `User.DoublePuppet`, `Bridge.GetExistingUserByMXID`, `dbutil` upgrade tables), the build or `go vet` step will say so; fix it in the `callreply*`/`callroom.go`
 files rather than in upstream code.
