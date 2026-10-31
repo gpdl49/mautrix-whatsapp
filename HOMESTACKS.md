@@ -163,6 +163,37 @@ login is deleted. Arming a bare `!wa schedule <time>` is in memory only and lost
 The timezone is upstream's `UserLoginMetadata.Timezone` (also used for local-time media requests),
 falling back to the bridge's local zone (UTC in the image). Offline hours live in portal metadata.
 
+**Frozen chats.** Stop bridging a chat for a while, then catch up on it in one go:
+
+```
+!wa freeze                  # in the chat's room
+!wa freeze +15550000001     # anywhere: that number's DM, on your default login
+!wa freeze list
+!wa unfreeze [+number]
+```
+
+While a chat is frozen its WhatsApp messages (including ones sent from your phone, reactions, edits
+and deletes) are not bridged. They are stored in `homestacks_frozen_event`, and `unfreeze` replays them
+in arrival order through upstream's own `handleWAMessage`, as if they had just arrived. They keep
+their original timestamps, edits and reactions land on the right messages, and you get notifications
+for them. Matrix messages and polls sent into a frozen chat are refused with a notice, and held messages
+due while it is frozen fail the same way. Reactions, edits and redactions from Matrix still go through.
+Typing, receipts and "waiting for this message" placeholders for undecryptable messages are not frozen.
+
+How: `checkFrozen` runs in `handleWAMessage` once the alt JIDs are filled in. It computes the
+message's portal key exactly as `QueueRemoteEvent` will, and stores the raw message proto (not the
+unwrapped copy, which the handler decrypts and rewrites in place) with its `MessageInfo` as JSON.
+Replay calls `handleWAMessage` again with a context flag that skips the check. The chat stays frozen
+while it replays in batches, so a message arriving mid-replay is held and goes out in the next batch;
+the locked check that finds nothing left is what unfreezes it. The lock is never held across a replay,
+so a long unfreeze doesn't stall other chats, and two unfreezes of one chat can't run at once. If a message cannot be
+replayed (its login is disconnected, or the handler fails), the chat stays frozen with that message and
+everything after it still held. Rows whose login was deleted are dropped. If storing a message fails,
+it is bridged straight away rather than lost. Freezing by number resolves it to the LID, since DM portals
+are keyed by LID. A DM room still keyed by phone number (not yet migrated to LID) refuses `freeze`,
+because its incoming messages would be keyed differently and never caught. The frozen list is kept in `homestacks_frozen_chat` (cached in memory), not in portal
+metadata, so a chat can be frozen before its room exists and `list` doesn't need to scan every portal.
+
 ## Branches and tags
 
 | Ref | Meaning |
@@ -191,8 +222,9 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 | Upstream file | Hook |
 |---|---|
 | `pkg/connector/client.go` | registers `handleCallAutoReply` as a second whatsmeow event handler, right after `handleWAEvent` |
-| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall`, `cmdRateLimit` and (on a second line) `cmdSchedule`, `cmdOfflineHours`, `cmdTimezone` to the command list; `startCallState` and `startHeldMessages` guards (each an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
-| `pkg/connector/handlematrix.go` | `checkHold` then `checkSendLimit` guards (each an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart` |
+| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall`, `cmdRateLimit`, (second line) `cmdSchedule`, `cmdOfflineHours`, `cmdTimezone` and (third line) `cmdFreeze`, `cmdUnfreeze` to the command list; `startCallState`, `startHeldMessages` and `startFreeze` guards (each an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
+| `pkg/connector/handlematrix.go` | `checkFrozenSend`, `checkHold` then `checkSendLimit` guards (each an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart` |
+| `pkg/connector/handlewhatsapp.go` | `checkFrozen` guard (an `if` with a `return`) in `handleWAMessage`, right after `ensureAltJIDs` |
 | `pkg/connector/config.go` | `CallAutoReply` field on `Config`; `postProcess()` call at the end of `PostProcess`; `upgradeCallAutoReplyConfig(helper)` in `upgradeConfig`; `call_auto_reply` block entry in `GetConfig` |
 | `pkg/connector/example-config.yaml` | `call_auto_reply:` section appended at the end |
 | `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata`; `RateLimit` and `OfflineHours` fields on `PortalMetadata` |
@@ -217,6 +249,9 @@ New files:
 | `pkg/connector/heldmsg_command.go` | `!wa schedule`, `!wa offline-hours`, `!wa timezone` |
 | `pkg/connector/heldmsg_test.go` | unit tests for time parsing, offline windows and the event round trip |
 | `pkg/waid/offlinehours.go` | per-chat offline hours stored in portal metadata |
+| `pkg/connector/freeze.go` | frozen chats: hold guard, `homestacks_frozen_chat`/`homestacks_frozen_event` tables, replay |
+| `pkg/connector/freeze_command.go` | `!wa freeze`, `!wa unfreeze` |
+| `pkg/connector/freeze_test.go` | unit tests for the event round trip, ordering and a SQLite round trip of the store |
 
 ## Upstreaming
 
@@ -280,7 +315,7 @@ git push origin homestacks
 git tag vX.Y.Z-hs.1 && git push origin vX.Y.Z-hs.1   # publish.yml builds the image
 ```
 
-If upstream changed something a feature relies on (`QueueMatrixEvent`, `matrix.ASIntent`, `RejectCall`, `BasicCallMeta`, `QueueRemoteEvent`,
+If upstream changed something a feature relies on (`handleWAMessage`, `MessageInfoWrapper.GetPortalKey`, `events.Message.UnwrapRaw`, `QueueMatrixEvent`, `matrix.ASIntent`, `RejectCall`, `BasicCallMeta`, `QueueRemoteEvent`,
 `commands.FullHandler`, `configupgrade`, `MatrixAPI.CreateRoom`/`EnsureJoined`/`DeleteRoom`,
 `User.DoublePuppet`, `Bridge.GetExistingUserByMXID`, `dbutil` upgrade tables), the build or `go vet` step will say so; fix it in the `callreply*`/`callroom.go`
 files rather than in upstream code.
