@@ -194,6 +194,58 @@ are keyed by LID. A DM room still keyed by phone number (not yet migrated to LID
 because its incoming messages would be keyed differently and never caught. The frozen list is kept in `homestacks_frozen_chat` (cached in memory), not in portal
 metadata, so a chat can be frozen before its room exists and `list` doesn't need to scan every portal.
 
+**Deprecated chats.** A permanent, slowed-down mode for a contact you no longer want a live
+conversation with:
+
+```
+!wa deprecate confirm                 # in the DM's room
+!wa deprecate +15550000001 confirm    # anywhere: that number's DM, on your default login
+!wa deprecate list
+```
+
+Without `confirm` the command only explains itself. In a deprecated DM:
+
+1. Their first message after a round ends opens a **batch**. It, and everything else in the chat
+   (more messages from them, reactions, edits, deletes, and messages you send from the phone), is
+   held for `deprecatedHoldDuration` (5 minutes).
+2. When the batch is due, it is replayed in order, with the original timestamps, through
+   upstream's `handleWAMessage`, exactly as on unfreeze. You get the usual notifications.
+3. After that you may send **one** message from Matrix. Further messages and polls are refused with
+   the bridge's failure notice ("this chat is deprecated and you have already sent your one
+   reply…"). So is anything sent while a batch is held. The next batch from them gives you a new
+   reply. Reactions, edits and redactions from Matrix are not limited.
+
+A message you send from the phone between batches also uses up the reply. You can't stop it, but
+the bridge counts it. If the bridge fails to send your reply, you get the reply back. When you
+deprecate a chat whose last message is theirs, you can reply once straight away; otherwise you
+wait for their next batch. Only one-to-one LID chats can be deprecated, as with `freeze`.
+
+**It survives deleting the chat and cannot be turned off.** State is in the fork's own tables
+(`homestacks_deprecated_chat`, `homestacks_deprecated_event`, versioned by
+`homestacks_deprecate_version`), keyed by portal key. A DM's portal key is the contact's LID plus
+the login, and it is the same for every room the chat ever has. Deleting the room, or the chat on
+the phone, leaves the row in place, so the next chat with them is deprecated from its first
+message, whoever starts it. Nothing in the fork deletes a row:
+there is no `undeprecate` command, config option or metadata flag, `!wa rate-limit off` and
+`!wa unfreeze` do not touch it, and if the tables cannot be loaded the bridge refuses to start
+rather than run without it.
+
+**To undeprecate a chat**, change the code. Add an upgrade step to `deprecateUpgrades` in `deprecate.go`
+that deletes the chat's `homestacks_deprecated_chat` row (`portal_id` = the contact's `…@lid` JID,
+`portal_receiver` = the login ID). Ship it while no batch is pending, meaning there are no
+`homestacks_deprecated_event` rows for the chat; `!wa deprecate list` shows this. Then release a new `-hs.N`.
+
+How: `checkDeprecated` runs in `handleWAMessage` right after `checkFrozen`, so a frozen chat's
+messages are held by the freeze first and then reach this check when the chat is unfrozen. It reuses
+freeze's message encoding (`encodeFrozenEvent`/`decodeFrozenEvent`) and its replay approach: the
+batch is closed by the locked check that finds no rows left, and a message arriving mid-replay joins
+the batch. `checkDeprecatedSend` runs after the other homestacks send guards, so a scheduled message
+is checked when it goes out, not when it is scheduled. It spends the reply before the send, so two
+quick messages can't both get through, and returns a `refund` that the handler defers with its named
+`retErr`. A 15-second loop releases due batches. A login that is offline is waited for. A message that
+keeps failing to replay is retried for an hour past its due time and then dropped (logged at error
+level), so that one bad message cannot block the chat forever.
+
 ## Branches and tags
 
 | Ref | Meaning |
@@ -222,9 +274,9 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 | Upstream file | Hook |
 |---|---|
 | `pkg/connector/client.go` | registers `handleCallAutoReply` as a second whatsmeow event handler, right after `handleWAEvent` |
-| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall`, `cmdRateLimit`, (second line) `cmdSchedule`, `cmdOfflineHours`, `cmdTimezone` and (third line) `cmdFreeze`, `cmdUnfreeze` to the command list; `startCallState`, `startHeldMessages` and `startFreeze` guards (each an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
-| `pkg/connector/handlematrix.go` | `checkFrozenSend`, `checkHold` then `checkSendLimit` guards (each an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart` |
-| `pkg/connector/handlewhatsapp.go` | `checkFrozen` guard (an `if` with a `return`) in `handleWAMessage`, right after `ensureAltJIDs` |
+| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall`, `cmdRateLimit`, (second line) `cmdSchedule`, `cmdOfflineHours`, `cmdTimezone`, (third line) `cmdFreeze`, `cmdUnfreeze` and (fourth line) `cmdDeprecate` to the command list; `startCallState`, `startHeldMessages`, `startFreeze` and `startDeprecated` guards (each an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
+| `pkg/connector/handlematrix.go` | `checkFrozenSend`, `checkHold` then `checkSendLimit` guards (each an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart`, then `checkDeprecatedSend` (assignment, `if` with a `return`, and `defer refund(&retErr)`: five lines) |
+| `pkg/connector/handlewhatsapp.go` | `checkFrozen` then `checkDeprecated` guards (each an `if` with a `return`) in `handleWAMessage`, right after `ensureAltJIDs` |
 | `pkg/connector/config.go` | `CallAutoReply` field on `Config`; `postProcess()` call at the end of `PostProcess`; `upgradeCallAutoReplyConfig(helper)` in `upgradeConfig`; `call_auto_reply` block entry in `GetConfig` |
 | `pkg/connector/example-config.yaml` | `call_auto_reply:` section appended at the end |
 | `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata`; `RateLimit` and `OfflineHours` fields on `PortalMetadata` |
@@ -252,6 +304,9 @@ New files:
 | `pkg/connector/freeze.go` | frozen chats: hold guard, `homestacks_frozen_chat`/`homestacks_frozen_event` tables, replay |
 | `pkg/connector/freeze_command.go` | `!wa freeze`, `!wa unfreeze` |
 | `pkg/connector/freeze_test.go` | unit tests for the event round trip, ordering and a SQLite round trip of the store |
+| `pkg/connector/deprecate.go` | deprecated chats: hold guard, `homestacks_deprecated_chat`/`homestacks_deprecated_event` tables, batch release loop, one-reply send guard with refund |
+| `pkg/connector/deprecate_command.go` | `!wa deprecate` (no undo, on purpose) |
+| `pkg/connector/deprecate_test.go` | hold decisions, message classification, store round trip on SQLite and (with `HOMESTACKS_TEST_POSTGRES` set to a URI) PostgreSQL, one reply per batch with refund |
 
 ## Upstreaming
 
@@ -315,7 +370,7 @@ git push origin homestacks
 git tag vX.Y.Z-hs.1 && git push origin vX.Y.Z-hs.1   # publish.yml builds the image
 ```
 
-If upstream changed something a feature relies on (`handleWAMessage`, `MessageInfoWrapper.GetPortalKey`, `events.Message.UnwrapRaw`, `QueueMatrixEvent`, `matrix.ASIntent`, `RejectCall`, `BasicCallMeta`, `QueueRemoteEvent`,
+If upstream changed something a feature relies on (`handleWAMessage`, `HandleMatrixMessage`'s named `retErr`, `MessageInfoWrapper.GetPortalKey`, `events.Message.UnwrapRaw`, `QueueMatrixEvent`, `matrix.ASIntent`, `RejectCall`, `BasicCallMeta`, `QueueRemoteEvent`,
 `commands.FullHandler`, `configupgrade`, `MatrixAPI.CreateRoom`/`EnsureJoined`/`DeleteRoom`,
 `User.DoublePuppet`, `Bridge.GetExistingUserByMXID`, `dbutil` upgrade tables), the build or `go vet` step will say so; fix it in the `callreply*`/`callroom.go`
 files rather than in upstream code.

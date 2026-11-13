@@ -76,6 +76,11 @@ func (wa *WhatsAppClient) HandleMatrixPollStart(ctx context.Context, msg *bridge
 	if err := wa.checkSendLimit(ctx, msg.Portal); err != nil { // homestacks: per-chat send limit
 		return nil, err
 	}
+	refund, err := wa.checkDeprecatedSend(ctx, msg.Portal) // homestacks: deprecated chats
+	if err != nil {                                        // homestacks: deprecated chats
+		return nil, err
+	}
+	defer refund(&retErr) // homestacks: deprecated chats
 	waMsg, optionMap, err := wa.Main.MsgConv.PollStartToWhatsApp(ctx, msg.Content, msg.ReplyTo, msg.Portal)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert poll vote: %w", err)
@@ -114,6 +119,11 @@ func (wa *WhatsAppClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 	if err := wa.checkSendLimit(ctx, msg.Portal); err != nil { // homestacks: per-chat send limit
 		return nil, err
 	}
+	refund, err := wa.checkDeprecatedSend(ctx, msg.Portal) // homestacks: deprecated chats
+	if err != nil {                                        // homestacks: deprecated chats
+		return nil, err
+	}
+	defer refund(&retErr) // homestacks: deprecated chats
 	waMsg, req, err := wa.Main.MsgConv.ToWhatsApp(ctx, wa.Client, msg.Event, msg.Content, msg.ReplyTo, msg.ThreadRoot, msg.Portal)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert message: %w", err)

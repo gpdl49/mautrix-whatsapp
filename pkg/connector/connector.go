@@ -114,6 +114,7 @@ func (wa *WhatsAppConnector) Init(bridge *bridgev2.Bridge) {
 		cmdCallReply, cmdCall, cmdRateLimit, // homestacks: call auto-reply, outgoing call invites, per-chat send limit
 		cmdSchedule, cmdOfflineHours, cmdTimezone, // homestacks: held messages
 		cmdFreeze, cmdUnfreeze, // homestacks: frozen chats
+		cmdDeprecate, // homestacks: deprecated chats
 	)
 	wa.mediaEditCache = make(MediaEditCache)
 	wa.unmigratedDMs = exsync.NewSet[networkid.PortalKey]()
@@ -170,6 +171,9 @@ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
 	}
 	if err = wa.startFreeze(ctx); err != nil { // homestacks: frozen chats
 		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_freeze"}
+	}
+	if err = wa.startDeprecated(ctx); err != nil { // homestacks: deprecated chats
+		return bridgev2.DBUpgradeError{Err: err, Section: "homestacks_deprecate"}
 	}
 
 	err = wa.migrateToLIDDMs(ctx)
