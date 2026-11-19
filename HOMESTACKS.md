@@ -130,8 +130,9 @@ unmodified `Dockerfile` by `.github/workflows/publish.yml`.
 ## Automation
 
 - `.github/workflows/upstream-sync.yml` — daily. Fetches upstream tags, merges the newest release tag not
-  yet in `homestacks`, builds, vets and tests, pushes, tags `<tag>-hs.1`, and calls `publish.yml`. On a merge
-  conflict it opens an issue titled `Upstream merge conflict: <tag>` and stops; resolve by hand (below).
+  yet in `homestacks`, builds, vets and tests, pushes, tags `<tag>-hs.1`, and calls `publish.yml`. On a
+  merge conflict the run fails, lists the conflicting files in its summary and stops; GitHub's failed-run
+  notification is the alert (issues are disabled on the fork). Resolve by hand (below).
 - `.github/workflows/publish.yml` — builds and pushes the image for a `v*-hs.*` tag (on tag push, on
   dispatch, or called by the sync workflow).
 - `.github/workflows/go.yml` — upstream's lint workflow, kept as is.
