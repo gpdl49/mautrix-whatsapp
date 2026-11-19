@@ -300,12 +300,6 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	if !wa.ensureAltJIDs(ctx, &evt.Info.MessageSource, true) {
 		return false
 	}
-	if wa.checkFrozen(ctx, evt) { // homestacks: frozen chats
-		return
-	}
-	if wa.checkDeprecated(ctx, evt) { // homestacks: deprecated chats
-		return
-	}
 	parsedMessageType := getMessageType(evt.Message)
 	if encReact := evt.Message.GetEncReactionMessage(); encReact != nil {
 		decrypted, err := wa.Client.DecryptReaction(ctx, evt)

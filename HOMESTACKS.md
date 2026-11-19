@@ -107,144 +107,14 @@ and groups, needs `call_link_base_url`, and has no cooldown — it only runs whe
 Set upstream's `call_start_notices: false` alongside, otherwise both the upstream "Incoming call" notice
 and ours appear.
 
-**Per-chat send limit.** A self-imposed cap on how much the user sends in a chat relative to the other
-side, set from the chat's own room:
-
-```
-!wa rate-limit reply [burst]            # up to burst (default 1) messages, then wait for a reply
-!wa rate-limit ratio 2:3 [burst]        # earn 2 messages per 3 of theirs, hold at most burst (default 2)
-!wa rate-limit show | off
-```
-
-A Matrix message over the limit is refused before it is converted or uploaded: it never reaches
-WhatsApp, is marked failed in Matrix, and the bridge's usual notice says why ("Your message was not
-bridged: rate limit for this chat … Wait for a reply"). No queueing or retries. Only messages and polls
-are limited; edits, reactions, deletes and the bridge's own `!wa call` invites are not.
-
-Counts come from the bridge's message table (last 200 messages, only those since the limit was set), so
-there is no counter to drift and nothing is lost on restart. Messages sent from the phone count toward
-the user's side and can overdraw the credit, but cannot be stopped. In groups "the other side" is
-everyone else combined. Settings live in portal metadata, so they are per chat and, with several
-logins, per login's chat. Setting a limit restarts it with full credit.
-
-Every limit also resets on its own every 36 hours, counted from when it was set: at each 36-hour mark the
-credit refills and only messages from then on count, so a chat where the other side went quiet does not
-stay blocked forever. The refusal notice and `show` both say when the next reset is. The period is fixed
-in code (`rateLimitResetPeriod`), not configurable per chat.
-
-**Held messages: scheduling and offline hours.** Matrix messages the bridge keeps back and sends to
-WhatsApp later, managed from the chat's own room:
-
-```
-!wa schedule 18:30                 # hold your next message here (within 10 min) until 18:30
-!wa schedule +45m Running late     # send this text in 45 minutes (also `in 45m`, `6:30pm`, `7am`)
-!wa schedule list | now [n|all] | cancel [n|all]
-!wa offline-hours 22:00-08:00      # messages sent 22:00–08:00 wait until 08:00
-!wa offline-hours show | off
-!wa timezone Europe/London         # zone for both; sets it on all your logins
-```
-
-Times are a time of day (the next time the clock reads it) or a `+` delay, at most 24 hours ahead. A
-held message gets a ⏰ reaction from the bot, which is removed when it is sent; the first message of an
-offline-hours batch also gets a notice. Messages sent while an offline batch is still waiting join it,
-even just after the window ends, so the chat never sees them out of order. An explicit schedule wins over
-offline hours. Any message type is held — media, polls, replies — but edits are not: edit a held message
-and the edit fails, so delete it and send again. **Deleting a held message in Matrix cancels it**; the
-bridge checks for a redaction just before sending.
-
-How: `checkHold` refuses the message with a `PENDING` status before it is converted (so nothing is
-uploaded) and stores the decrypted event in `homestacks_held_message`. Every 15s due rows are deleted and
-the same event is queued back into the bridge with `Bridge.QueueMatrixEvent`; `checkHold` lets it through
-once. The WhatsApp message therefore maps to the original Matrix event, and the per-chat send limit
-applies at send time, not hold time. With inline text the command event itself becomes the message.
-Rows wait while their login is disconnected (the whole room, to keep order) and are dropped if the
-login is deleted. Arming a bare `!wa schedule <time>` is in memory only and lost on restart.
-
-The timezone is upstream's `UserLoginMetadata.Timezone` (also used for local-time media requests),
-falling back to the bridge's local zone (UTC in the image). Offline hours live in portal metadata.
-
-**Frozen chats.** Stop bridging a chat for a while, then catch up on it in one go:
-
-```
-!wa freeze                  # in the chat's room
-!wa freeze +15550000001     # anywhere: that number's DM, on your default login
-!wa freeze list
-!wa unfreeze [+number]
-```
-
-While a chat is frozen its WhatsApp messages (including ones sent from your phone, reactions, edits
-and deletes) are not bridged. They are stored in `homestacks_frozen_event`, and `unfreeze` replays them
-in arrival order through upstream's own `handleWAMessage`, as if they had just arrived. They keep
-their original timestamps, edits and reactions land on the right messages, and you get notifications
-for them. Matrix messages and polls sent into a frozen chat are refused with a notice, and held messages
-due while it is frozen fail the same way. Reactions, edits and redactions from Matrix still go through.
-Typing, receipts and "waiting for this message" placeholders for undecryptable messages are not frozen.
-
-How: `checkFrozen` runs in `handleWAMessage` once the alt JIDs are filled in. It computes the
-message's portal key exactly as `QueueRemoteEvent` will, and stores the raw message proto (not the
-unwrapped copy, which the handler decrypts and rewrites in place) with its `MessageInfo` as JSON.
-Replay calls `handleWAMessage` again with a context flag that skips the check. The chat stays frozen
-while it replays in batches, so a message arriving mid-replay is held and goes out in the next batch;
-the locked check that finds nothing left is what unfreezes it. The lock is never held across a replay,
-so a long unfreeze doesn't stall other chats, and two unfreezes of one chat can't run at once. If a message cannot be
-replayed (its login is disconnected, or the handler fails), the chat stays frozen with that message and
-everything after it still held. Rows whose login was deleted are dropped. If storing a message fails,
-it is bridged straight away rather than lost. Freezing by number resolves it to the LID, since DM portals
-are keyed by LID. A DM room still keyed by phone number (not yet migrated to LID) refuses `freeze`,
-because its incoming messages would be keyed differently and never caught. The frozen list is kept in `homestacks_frozen_chat` (cached in memory), not in portal
-metadata, so a chat can be frozen before its room exists and `list` doesn't need to scan every portal.
-
-**Deprecated chats.** A permanent, slowed-down mode for a contact you no longer want a live
-conversation with:
-
-```
-!wa deprecate confirm                 # in the DM's room
-!wa deprecate +15550000001 confirm    # anywhere: that number's DM, on your default login
-!wa deprecate list
-```
-
-Without `confirm` the command only explains itself. In a deprecated DM:
-
-1. Their first message after a round ends opens a **batch**. It, and everything else in the chat
-   (more messages from them, reactions, edits, deletes, and messages you send from the phone), is
-   held for `deprecatedHoldDuration` (5 minutes).
-2. When the batch is due, it is replayed in order, with the original timestamps, through
-   upstream's `handleWAMessage`, exactly as on unfreeze. You get the usual notifications.
-3. After that you may send **one** message from Matrix. Further messages and polls are refused with
-   the bridge's failure notice ("this chat is deprecated and you have already sent your one
-   reply…"). So is anything sent while a batch is held. The next batch from them gives you a new
-   reply. Reactions, edits and redactions from Matrix are not limited.
-
-A message you send from the phone between batches also uses up the reply. You can't stop it, but
-the bridge counts it. If the bridge fails to send your reply, you get the reply back. When you
-deprecate a chat whose last message is theirs, you can reply once straight away; otherwise you
-wait for their next batch. Only one-to-one LID chats can be deprecated, as with `freeze`.
-
-**It survives deleting the chat and cannot be turned off.** State is in the fork's own tables
-(`homestacks_deprecated_chat`, `homestacks_deprecated_event`, versioned by
-`homestacks_deprecate_version`), keyed by portal key. A DM's portal key is the contact's LID plus
-the login, and it is the same for every room the chat ever has. Deleting the room, or the chat on
-the phone, leaves the row in place, so the next chat with them is deprecated from its first
-message, whoever starts it. Nothing in the fork deletes a row:
-there is no `undeprecate` command, config option or metadata flag, `!wa rate-limit off` and
-`!wa unfreeze` do not touch it, and if the tables cannot be loaded the bridge refuses to start
-rather than run without it.
-
-**To undeprecate a chat**, change the code. Add an upgrade step to `deprecateUpgrades` in `deprecate.go`
-that deletes the chat's `homestacks_deprecated_chat` row (`portal_id` = the contact's `…@lid` JID,
-`portal_receiver` = the login ID). Ship it while no batch is pending, meaning there are no
-`homestacks_deprecated_event` rows for the chat; `!wa deprecate list` shows this. Then release a new `-hs.N`.
-
-How: `checkDeprecated` runs in `handleWAMessage` right after `checkFrozen`, so a frozen chat's
-messages are held by the freeze first and then reach this check when the chat is unfrozen. It reuses
-freeze's message encoding (`encodeFrozenEvent`/`decodeFrozenEvent`) and its replay approach: the
-batch is closed by the locked check that finds no rows left, and a message arriving mid-replay joins
-the batch. `checkDeprecatedSend` runs after the other homestacks send guards, so a scheduled message
-is checked when it goes out, not when it is scheduled. It spends the reply before the send, so two
-quick messages can't both get through, and returns a `refund` that the handler defers with its named
-`retErr`. A 15-second loop releases due batches. A login that is offline is waited for. A message that
-keeps failing to replay is retried for an hour past its due time and then dropped (logged at error
-level), so that one bad message cannot block the chat forever.
+The fork used to carry a per-chat send limit (`!wa rate-limit`), held messages (`!wa schedule`,
+`!wa offline-hours`, `!wa timezone`), frozen chats (`!wa freeze`/`unfreeze`) and deprecated chats
+(`!wa deprecate`). They were removed after `v0.2610.0-hs.4`; that tag has the last code. Their tables
+(`homestacks_held_message`, `homestacks_frozen_chat`, `homestacks_frozen_event`,
+`homestacks_deprecated_chat`, `homestacks_deprecated_event`, plus the version tables
+`homestacks_heldmsg_version`, `homestacks_freeze_version` and `homestacks_deprecate_version`) are no
+longer read or written and can be dropped. Old `rate_limit` and `offline_hours` keys in portal metadata
+are ignored.
 
 ## Branches and tags
 
@@ -274,12 +144,10 @@ All feature code lives in **new files**. Every hook into an upstream file is a s
 | Upstream file | Hook |
 |---|---|
 | `pkg/connector/client.go` | registers `handleCallAutoReply` as a second whatsmeow event handler, right after `handleWAEvent` |
-| `pkg/connector/connector.go` | adds `cmdCallReply`, `cmdCall`, `cmdRateLimit`, (second line) `cmdSchedule`, `cmdOfflineHours`, `cmdTimezone`, (third line) `cmdFreeze`, `cmdUnfreeze` and (fourth line) `cmdDeprecate` to the command list; `startCallState`, `startHeldMessages`, `startFreeze` and `startDeprecated` guards (each an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
-| `pkg/connector/handlematrix.go` | `checkFrozenSend`, `checkHold` then `checkSendLimit` guards (each an `if` with a `return`, so three lines after gofmt) at the top of `HandleMatrixMessage` and `HandleMatrixPollStart`, then `checkDeprecatedSend` (assignment, `if` with a `return`, and `defer refund(&retErr)`: five lines) |
-| `pkg/connector/handlewhatsapp.go` | `checkFrozen` then `checkDeprecated` guards (each an `if` with a `return`) in `handleWAMessage`, right after `ensureAltJIDs` |
+| `pkg/connector/connector.go` | adds `cmdCallReply` and `cmdCall` to the command list; `startCallState` guard (an `if` with a `return`, three lines after gofmt) in `Start`, right after the `whatsapp` DB upgrade |
 | `pkg/connector/config.go` | `CallAutoReply` field on `Config`; `postProcess()` call at the end of `PostProcess`; `upgradeCallAutoReplyConfig(helper)` in `upgradeConfig`; `call_auto_reply` block entry in `GetConfig` |
 | `pkg/connector/example-config.yaml` | `call_auto_reply:` section appended at the end |
-| `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata`; `RateLimit` and `OfflineHours` fields on `PortalMetadata` |
+| `pkg/waid/dbmeta.go` | `CallAutoReply` field on `UserLoginMetadata` |
 
 New files:
 
@@ -293,20 +161,6 @@ New files:
 | `pkg/connector/callinvite.go` | `!wa call`: call room + WhatsApp invite text, mirrored into the portal |
 | `pkg/connector/callreply_test.go` | unit tests for the pure parts, the tracker/cooldown logic, and a SQLite round trip of `callstate.go` |
 | `pkg/waid/callreply.go` | per-login settings stored in login metadata |
-| `pkg/connector/ratelimit.go` | per-chat send limit: history replay, credit arithmetic, refusal |
-| `pkg/connector/ratelimit_command.go` | `!wa rate-limit` |
-| `pkg/connector/ratelimit_test.go` | unit tests for the replay and argument parsing |
-| `pkg/waid/ratelimit.go` | per-chat settings stored in portal metadata |
-| `pkg/connector/heldmsg.go` | held messages: hold guard, `homestacks_held_message` table, release loop, time parsing |
-| `pkg/connector/heldmsg_command.go` | `!wa schedule`, `!wa offline-hours`, `!wa timezone` |
-| `pkg/connector/heldmsg_test.go` | unit tests for time parsing, offline windows and the event round trip |
-| `pkg/waid/offlinehours.go` | per-chat offline hours stored in portal metadata |
-| `pkg/connector/freeze.go` | frozen chats: hold guard, `homestacks_frozen_chat`/`homestacks_frozen_event` tables, replay |
-| `pkg/connector/freeze_command.go` | `!wa freeze`, `!wa unfreeze` |
-| `pkg/connector/freeze_test.go` | unit tests for the event round trip, ordering and a SQLite round trip of the store |
-| `pkg/connector/deprecate.go` | deprecated chats: hold guard, `homestacks_deprecated_chat`/`homestacks_deprecated_event` tables, batch release loop, one-reply send guard with refund |
-| `pkg/connector/deprecate_command.go` | `!wa deprecate` (no undo, on purpose) |
-| `pkg/connector/deprecate_test.go` | hold decisions, message classification, store round trip on SQLite and (with `HOMESTACKS_TEST_POSTGRES` set to a URI) PostgreSQL, one reply per batch with refund |
 
 ## Upstreaming
 
