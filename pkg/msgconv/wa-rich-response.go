@@ -29,6 +29,7 @@ import (
 	"github.com/yuin/goldmark/extension"
 	"go.mau.fi/whatsmeow/types/richresponse"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/crypto/canonicaljson"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/format/mdext"
@@ -36,7 +37,8 @@ import (
 
 func (mc *MessageConverter) convertUnifiedRichResponseMessage(ctx context.Context, data []byte) *bridgev2.ConvertedMessagePart {
 	extra := map[string]any{}
-	if json.Valid(data) && len(data) < 24*1024 {
+	_, canonicalErr := canonicaljson.Marshal(json.RawMessage(data))
+	if canonicalErr == nil && len(data) < 24*1024 {
 		extra["fi.mau.whatsapp.rich_message"] = json.RawMessage(data)
 	} else if len(data) < 16*1024 {
 		extra["fi.mau.whatsapp.non_json_rich_message"] = base64.StdEncoding.EncodeToString(data)
@@ -66,10 +68,15 @@ func (mc *MessageConverter) convertUnifiedRichResponseMessage(ctx context.Contex
 			Extra: extra,
 		}
 	}
+	content := format.HTMLToContent(htmlBuf.String())
+	if len(data)+len(content.Body)+len(content.FormattedBody) > 40000 {
+		delete(extra, "fi.mau.whatsapp.rich_message")
+		delete(extra, "fi.mau.whatsapp.non_json_rich_message")
+	}
 	extra["fi.mau.whatsapp.rich_response_id"] = rrMsg.ResponseID
 	return &bridgev2.ConvertedMessagePart{
 		Type:    event.EventMessage,
-		Content: new(format.HTMLToContent(htmlBuf.String())),
+		Content: &content,
 		Extra:   extra,
 	}
 }

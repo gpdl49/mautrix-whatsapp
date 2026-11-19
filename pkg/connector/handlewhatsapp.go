@@ -237,7 +237,11 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		})
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("stream error: %s", message))
 	case *events.StreamReplaced:
-		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Error: WAStreamReplaced})
+		wa.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent:         status.StateUnknownError,
+			Error:              WAStreamReplaced,
+			BlockAutoReconnect: true,
+		})
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("stream replaced"))
 	case *events.KeepAliveTimeout:
 		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateTransientDisconnect, Error: WAKeepaliveTimeout})
@@ -253,12 +257,17 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("connection failure: %s (%s)", evt.Reason, evt.Message))
 	case *events.ClientOutdated:
 		wa.UserLogin.Log.Error().Msg("Got a client outdated connect failure. The bridge is likely out of date, please update immediately.")
-		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Error: WAClientOutdated})
+		wa.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent:         status.StateUnknownError,
+			Error:              WAClientOutdated,
+			BlockAutoReconnect: true,
+		})
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("client outdated"))
 	case *events.TemporaryBan:
 		wa.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      WATemporaryBan,
+			UserAction: status.UserActionRestart,
 			Message:    evt.String(),
 		})
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("temporary ban: %s", evt.String()))
@@ -365,6 +374,14 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	if assocType := messageAssoc.GetAssociationType(); assocType == waE2E.MessageAssociation_HD_IMAGE_DUAL_UPLOAD || assocType == waE2E.MessageAssociation_HD_VIDEO_DUAL_UPLOAD {
 		parentKey := messageAssoc.GetParentMessageKey()
 		protocolMsg, shouldHideEdit := makeHDMediaReplacementEdit(evt.Message, parentKey)
+		if protocolMsg.GetEditedMessage() == nil {
+			wa.UserLogin.Log.Debug().
+				Str("message_id", evt.Info.ID).
+				Str("parent_id", parentKey.GetID()).
+				Stringer("assoc_type", assocType).
+				Msg("Ignoring HD replacement message without replacement content")
+			return
+		}
 		dontRenderEdited = shouldHideEdit
 		wa.UserLogin.Log.Debug().
 			Str("message_id", evt.Info.ID).
@@ -513,6 +530,10 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	} else if evt.Chat.Server == types.NewsletterServer {
 		messageSender = evt.Chat
 	}
+	var messageSenderAlt types.JID
+	if evt.MessageSender.IsEmpty() && evt.Chat.Server == types.BotServer {
+		messageSenderAlt = wa.JID
+	}
 	var chatAlt types.JID
 	if evt.Chat.Server == types.DefaultUserServer {
 		chatLID, _ := wa.GetStore().LIDs.GetLIDForPN(ctx, evt.Chat)
@@ -525,6 +546,9 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 		targets = append(targets, waid.MakeMessageID(evt.Chat, messageSender, id))
 		if !chatAlt.IsEmpty() {
 			targets = append(targets, waid.MakeMessageID(chatAlt, messageSender, id))
+		}
+		if !messageSenderAlt.IsEmpty() {
+			targets = append(targets, waid.MakeMessageID(evt.Chat, messageSenderAlt, id))
 		}
 	}
 	senderLID := evt.Sender
@@ -713,6 +737,27 @@ func (wa *WhatsAppClient) handleWADeleteChat(ctx context.Context, evt *events.De
 			Type:      bridgev2.RemoteEventChatDelete,
 			PortalKey: wa.makeWAPortalKey(chatJID),
 			Timestamp: evt.Timestamp,
+			PreHandleWithResultFunc: func(ctx context.Context, portal *bridgev2.Portal) *bridgev2.EventHandlingResult {
+				messageRange := evt.Action.GetMessageRange()
+				deletedAt := max(
+					evt.Timestamp.Unix(),
+					messageRange.GetLastMessageTimestamp(),
+					messageRange.GetLastSystemMessageTimestamp(),
+				)
+				if deletedAt <= 0 {
+					return nil
+				}
+				lastMessage, err := wa.Main.Bridge.DB.Message.GetLastNInPortal(ctx, portal.PortalKey, 1)
+				if err != nil {
+					zerolog.Ctx(ctx).Err(err).Msg("Failed to get last message to check if chat delete is outdated")
+				} else if len(lastMessage) == 1 && lastMessage[0].Timestamp.Unix() > deletedAt {
+					zerolog.Ctx(ctx).Debug().
+						Time("last_message_ts", lastMessage[0].Timestamp).
+						Msg("Ignoring chat delete that is older than the last message")
+					return ptr.Ptr(bridgev2.EventHandlingResultIgnored)
+				}
+				return nil
+			},
 		},
 		OnlyForMe: true,
 		Children:  true,
@@ -933,7 +978,9 @@ func (wa *WhatsAppClient) handleWAAppStateSyncComplete(ctx context.Context, evt 
 	defer wa.appStateRecoveryLock.Unlock()
 	meta := wa.UserLogin.Metadata.(*waid.UserLoginMetadata)
 	if ts, exists := meta.AppStateRecoveryAttempted[evt.Name]; exists {
-		delete(wa.appStateFullSyncAttempted, evt.Name)
+		if !evt.Recovery {
+			delete(wa.appStateFullSyncAttempted, evt.Name)
+		}
 		delete(meta.AppStateRecoveryAttempted, evt.Name)
 		err := wa.UserLogin.Save(ctx)
 		if err != nil {
@@ -971,7 +1018,7 @@ func (wa *WhatsAppClient) handleWAAppStateSyncError(ctx context.Context, evt *ev
 		return
 	}
 	if !evt.FullSync {
-		if !lastFullSync.IsZero() {
+		if !lastFullSync.IsZero() && time.Since(lastFullSync) < 48*time.Hour {
 			log.Debug().
 				Err(evt.Error).
 				Time("last_full_sync_attempt", lastFullSync).

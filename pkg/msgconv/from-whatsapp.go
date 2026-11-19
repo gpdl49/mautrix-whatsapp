@@ -17,6 +17,7 @@
 package msgconv
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"html"
@@ -75,8 +76,7 @@ func (mc *MessageConverter) getBasicUserInfo(ctx context.Context, user types.JID
 	var pnJID types.JID
 	if user.Server == types.DefaultUserServer {
 		pnJID = user
-	} else if user.Server == types.HiddenUserServer {
-		cli := getClient(ctx)
+	} else if cli := getClient(ctx); user.Server == types.HiddenUserServer && cli != nil {
 		if user.User == cli.Store.GetLID().User {
 			pnJID = cli.Store.GetJID()
 		} else {
@@ -92,7 +92,7 @@ func (mc *MessageConverter) getBasicUserInfo(ctx context.Context, user types.JID
 		portal := getPortal(ctx)
 		login := mc.Bridge.GetCachedUserLoginByID(waid.MakeUserLoginID(pnJID))
 		if login != nil && (portal.Receiver == "" || portal.Receiver == login.ID) {
-			return login.UserMXID, ghost.Name, nil
+			return login.UserMXID, cmp.Or(login.RemoteProfile.Name, ghost.Name), nil
 		}
 	}
 	return ghost.Intent.GetMXID(), ghost.Name, nil
@@ -187,7 +187,7 @@ func (mc *MessageConverter) ToMatrix(
 	case waMsg.EventMessage != nil:
 		part, contextInfo = mc.convertEventMessage(ctx, waMsg.EventMessage)
 	case waMsg.PinInChatMessage != nil:
-		part, contextInfo = mc.convertPinInChatMessage(ctx, waMsg.PinInChatMessage)
+		part, contextInfo = mc.convertPinInChatMessage(ctx, info, waMsg.PinInChatMessage)
 	case waMsg.KeepInChatMessage != nil:
 		part, contextInfo = mc.convertKeepInChatMessage(ctx, waMsg.KeepInChatMessage)
 	case waMsg.RichResponseMessage != nil:
@@ -320,6 +320,8 @@ func (mc *MessageConverter) ToMatrix(
 		}
 		cm.ThreadRoot = ptr.Ptr(waid.MakeMessageID(chat, pcp, commentTarget.GetID()))
 	}
+	mc.cutOffLongMessage(part.Content)
+	logOversizedPart(ctx, part)
 
 	return cm
 }

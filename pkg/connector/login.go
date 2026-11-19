@@ -137,6 +137,7 @@ var (
 	_ bridgev2.LoginProcessDisplayAndWait = (*WALogin)(nil)
 	_ bridgev2.LoginProcessUserInput      = (*WALogin)(nil)
 	_ bridgev2.LoginProcessWithOverride   = (*WALogin)(nil)
+	_ bridgev2.LoginProcessWithParams     = (*WALogin)(nil)
 	_ bridgev2.LoginProcessWebAuthn       = (*WALogin)(nil)
 )
 
@@ -144,6 +145,14 @@ const LoginConnectWait = 30 * time.Second
 const LoginPairPhoneWait = 30 * time.Second
 
 func (wl *WALogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	return wl.StartWithParams(ctx, bridgev2.LoginStartParams{})
+}
+
+func (wl *WALogin) StartWithOverride(ctx context.Context, old *bridgev2.UserLogin) (*bridgev2.LoginStep, error) {
+	return wl.StartWithParams(ctx, bridgev2.LoginStartParams{Override: old})
+}
+
+func (wl *WALogin) StartWithParams(ctx context.Context, params bridgev2.LoginStartParams) (*bridgev2.LoginStep, error) {
 	wl.Main.firstClientConnectOnce.Do(wl.Main.onFirstClientConnect)
 	device := wl.Main.DeviceStore.NewDevice()
 	wl.Client = whatsmeow.NewClient(device, waLog.Zerolog(wl.Log))
@@ -153,8 +162,20 @@ func (wl *WALogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	if err := wl.Main.updateProxy(ctx, wl.Client, true); err != nil {
 		return nil, err
 	}
+	if params.WebSocketHTTP != nil {
+		wl.Client.SetPreLoginHTTPClient(&http.Client{Transport: params.WebSocketHTTP})
+	}
 
 	if wl.PhoneCode {
+		if params.Override != nil {
+			phoneNumber := fmt.Sprintf("+%s", params.Override.ID)
+			wl.Log.Debug().
+				Str("phone_number", phoneNumber).
+				Msg("Auto-submitting phone number for relogin")
+			return wl.SubmitUserInput(ctx, map[string]string{
+				"phone_number": phoneNumber,
+			})
+		}
 		return &bridgev2.LoginStep{
 			Type:   bridgev2.LoginStepTypeUserInput,
 			StepID: LoginStepIDPhoneNumber,
@@ -171,7 +192,7 @@ func (wl *WALogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	err := wl.Client.Connect()
 	if err != nil {
 		wl.Log.Err(err).Msg("Failed to connect to WhatsApp for QR login")
-		return nil, err
+		return nil, wrapWhatsAppRespError(err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, LoginConnectWait)
 	defer cancel()
@@ -184,25 +205,11 @@ func (wl *WALogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	return makeQRStep(wl.QRs[0]), nil
 }
 
-func (wl *WALogin) StartWithOverride(ctx context.Context, old *bridgev2.UserLogin) (*bridgev2.LoginStep, error) {
-	step, err := wl.Start(ctx)
-	if err == nil && step != nil && old != nil && step.StepID == LoginStepIDPhoneNumber {
-		phoneNumber := fmt.Sprintf("+%s", old.ID)
-		wl.Log.Debug().
-			Str("phone_number", phoneNumber).
-			Msg("Auto-submitting phone number for relogin")
-		return wl.SubmitUserInput(ctx, map[string]string{
-			"phone_number": phoneNumber,
-		})
-	}
-	return step, err
-}
-
 func (wl *WALogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
 	err := wl.Client.Connect()
 	if err != nil {
 		wl.Log.Err(err).Msg("Failed to connect to WhatsApp for phone code login")
-		return nil, err
+		return nil, wrapWhatsAppRespError(err)
 	}
 	connectCtx, cancelConnect := context.WithTimeout(ctx, LoginConnectWait)
 	err = wl.WaitForQRs.Wait(connectCtx)
@@ -223,7 +230,7 @@ func (wl *WALogin) SubmitUserInput(ctx context.Context, input map[string]string)
 		} else if errors.Is(err, whatsmeow.ErrIQRateOverLimit) {
 			return nil, ErrRateLimitedByWhatsApp
 		}
-		return nil, err
+		return nil, wrapWhatsAppRespError(err)
 	}
 	wl.Log.Debug().Msg("Phone code login started")
 	return &bridgev2.LoginStep{
@@ -281,6 +288,7 @@ func (wl *WALogin) handleEvent(rawEvt any) {
 			wl.QRs[i] = strings.Replace(code, evt.OldSecret, evt.NewSecret, 1)
 		}
 		wl.ADVRotate.Set()
+		return
 	case *events.QRScannedWithoutMultidevice:
 		wl.Log.Error().Msg("QR code scanned without multidevice enabled")
 		wl.LoginError = ErrLoginMultideviceNotEnabled
@@ -316,6 +324,7 @@ func (wl *WALogin) handleEvent(rawEvt any) {
 		wl.LoginError = ErrUnexpectedDisconnect
 	case *events.ManualLoginReconnect:
 		wl.Received515.Set()
+		return
 	default:
 		wl.Log.Warn().Type("event_type", evt).Msg("Got unexpected event")
 		return
@@ -364,9 +373,14 @@ func (wl *WALogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 		case <-wl.PasskeyRequest.GetChan():
 			return wl.makePasskeyStep()
 		case <-wl.ADVRotate.GetChan():
-			wl.Log.Debug().Msg("ADV secret was rotated, returning new QR immediately")
 			wl.ADVRotate.Clear()
-			return makeQRStep(wl.QRs[nextIndex]), nil
+			if currentIndex < 0 || currentIndex >= len(wl.QRs) {
+				wl.Log.Debug().Msg("ADV secret was rotated, but no QRs are left to return")
+				wl.Cancel()
+				return nil, ErrLoginTimeout
+			}
+			wl.Log.Debug().Msg("ADV secret was rotated, returning current QR immediately")
+			return makeQRStep(wl.QRs[currentIndex]), nil
 		case <-wl.LoginComplete.GetChan():
 			// continue
 		}
@@ -461,7 +475,7 @@ func (wl *WALogin) SubmitWebAuthnResponse(ctx context.Context, rawResp json.RawM
 	if err != nil {
 		wl.Log.Err(err).Msg("Failed to send WebAuthn response")
 		wl.Cancel()
-		return nil, err
+		return nil, wrapWhatsAppRespError(err)
 	}
 	select {
 	case <-ctx.Done():
@@ -480,7 +494,7 @@ func (wl *WALogin) SubmitWebAuthnResponse(ctx context.Context, rawResp json.RawM
 		if err != nil {
 			wl.Log.Err(err).Msg("Failed to send WebAuthn confirmation")
 			wl.Cancel()
-			return nil, err
+			return nil, wrapWhatsAppRespError(err)
 		}
 	case <-wl.LoginComplete.GetChan():
 	}

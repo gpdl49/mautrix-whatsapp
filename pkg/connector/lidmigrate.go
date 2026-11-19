@@ -18,6 +18,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -25,9 +26,11 @@ import (
 	"go.mau.fi/util/dbutil"
 	"go.mau.fi/whatsmeow/types"
 
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
@@ -47,6 +50,8 @@ func (wa *WhatsAppClient) FindAltTargetMessage(ctx context.Context, targetMsg ne
 		if err != nil {
 			return nil, err
 		}
+	} else if parsed.Chat == types.NewMetaAIJID {
+		altChat = types.MetaAIJID
 	}
 	if !altSender.IsEmpty() {
 		altSenderID := *parsed
@@ -58,6 +63,8 @@ func (wa *WhatsAppClient) FindAltTargetMessage(ctx context.Context, targetMsg ne
 		altChatID.Chat = altChat
 		if altSender.Server == types.DefaultUserServer {
 			altChatID.Sender = altSender
+		} else if parsed.Sender == types.NewMetaAIJID {
+			altChatID.Sender = types.MetaAIJID
 		}
 		alts = append(alts, altChatID.String())
 	}
@@ -211,6 +218,30 @@ func (wa *WhatsAppConnector) migrateToLIDDMs(ctx context.Context) error {
 	return nil
 }
 
+func (wa *WhatsAppConnector) migrateMetaAIPortals(ctx context.Context) error {
+	if wa.Bridge.Background || wa.Bridge.DB.KV.Get(ctx, "whatsapp_meta_ai_portals_migrated") == "true" {
+		return nil
+	}
+	log := zerolog.Ctx(ctx).With().Str("action", "migrate meta ai portals").Logger()
+	const findMetaAIPortals = "SELECT id, receiver FROM portal WHERE bridge_id=$1 AND id=$2"
+	portalKeys, err := scanPortalKey.NewRowIter(wa.Bridge.DB.Query(ctx, findMetaAIPortals, wa.Bridge.ID, waid.MakePortalID(types.MetaAIJID))).AsList()
+	if err != nil {
+		return fmt.Errorf("failed to get Meta AI portals: %w", err)
+	}
+	for _, key := range portalKeys {
+		res, err := wa.reIDPhoneDMToLID(ctx, types.MetaAIJID, types.NewMetaAIJID, key.Receiver)
+		if err != nil {
+			return fmt.Errorf("failed to re-ID Meta AI portal for %s: %w", key.Receiver, err)
+		}
+		log.Info().
+			Str("receiver", string(key.Receiver)).
+			Stringer("result", res).
+			Msg("Re-ID'd Meta AI phone number portal")
+	}
+	wa.Bridge.DB.KV.Set(ctx, "whatsapp_meta_ai_portals_migrated", "true")
+	return nil
+}
+
 func (wa *WhatsAppConnector) syncMismatchingGhosts(ctx context.Context) error {
 	if wa.Bridge.Background || wa.Bridge.DB.KV.Get(ctx, "whatsapp_lid_avatars_resynced") == "true" {
 		return nil
@@ -267,3 +298,84 @@ func (wa *WhatsAppConnector) syncMismatchingGhosts(ctx context.Context) error {
 	wa.Bridge.DB.KV.Set(ctx, "whatsapp_lid_avatars_resynced", "true")
 	return nil
 }
+
+func (wa *WhatsAppConnector) removeRejoinedPNGhosts(ctx context.Context) error {
+	if wa.Bridge.Background || wa.Bridge.DB.KV.Get(ctx, "whatsapp_lid_dm_pn_ghosts_removed_v2") == "true" {
+		return nil
+	}
+	stateGetter, ok := wa.Bridge.Matrix.(bridgev2.MatrixConnectorWithArbitraryRoomState)
+	if !ok {
+		return nil
+	}
+	log := zerolog.Ctx(ctx).With().Str("action", "remove rejoined pn ghosts").Logger()
+	const findLIDPortals = "SELECT id, mxid FROM portal WHERE bridge_id=$1 AND room_type='dm' AND id LIKE '%@lid' AND mxid IS NOT NULL"
+	lidPortals, err := scanLIDPortal.NewRowIter(wa.Bridge.DB.Query(ctx, findLIDPortals, wa.Bridge.ID)).AsList()
+	if err != nil {
+		return fmt.Errorf("failed to get LID portals: %w", err)
+	}
+	var removed, failed int
+	for _, portal := range lidPortals {
+		lid, err := waid.ParsePortalID(portal.ID)
+		if err != nil || lid.Server != types.HiddenUserServer {
+			continue
+		}
+		pn, err := wa.DeviceStore.LIDMap.GetPNForLID(ctx, lid)
+		if err != nil {
+			return fmt.Errorf("failed to get PN for LID portal %s: %w", portal.ID, err)
+		} else if pn.IsEmpty() {
+			continue
+		}
+		pnUserID := waid.MakeUserID(pn)
+		memberEvt, err := stateGetter.GetStateEvent(ctx, portal.MXID, event.StateMember, wa.Bridge.Matrix.FormatGhostMXID(pnUserID).String())
+		if errors.Is(err, mautrix.MNotFound) || errors.Is(err, mautrix.MForbidden) {
+			continue
+		} else if err != nil {
+			log.Warn().Err(err).Stringer("room_id", portal.MXID).Msg("Failed to get PN ghost membership")
+			failed++
+			continue
+		} else if memberEvt == nil || memberEvt.Content.AsMember().Membership != event.MembershipJoin {
+			continue
+		}
+		pnGhost, err := wa.Bridge.GetGhostByID(ctx, pnUserID)
+		if err != nil {
+			return fmt.Errorf("failed to get PN ghost for %s: %w", pn, err)
+		}
+		_, err = pnGhost.Intent.SendState(ctx, portal.MXID, event.StateMember, pnGhost.Intent.GetMXID().String(), &event.Content{
+			Parsed: &event.MemberEventContent{Membership: event.MembershipLeave, Reason: "Migrating to LIDs"},
+			Raw:    map[string]any{"com.beeper.exclude_from_timeline": true},
+		}, time.Time{})
+		if err != nil {
+			log.Err(err).Stringer("room_id", portal.MXID).Stringer("pn", pn).Msg("Failed to remove PN ghost from LID DM")
+			if !errors.Is(err, mautrix.MForbidden) && !errors.Is(err, mautrix.MNotFound) {
+				failed++
+			}
+			continue
+		}
+		log.Debug().
+			Stringer("room_id", portal.MXID).
+			Stringer("pn", pn).
+			Stringer("join_sender", memberEvt.Sender).
+			Time("join_ts", time.UnixMilli(memberEvt.Timestamp)).
+			Msg("Removed PN ghost from LID DM")
+		removed++
+	}
+	log.Info().
+		Int("removed_ghosts", removed).
+		Int("failed", failed).
+		Int("total_lid_portals", len(lidPortals)).
+		Msg("Finished removing rejoined PN ghosts from LID DMs")
+	if failed == 0 && ctx.Err() == nil {
+		wa.Bridge.DB.KV.Set(ctx, "whatsapp_lid_dm_pn_ghosts_removed_v2", "true")
+	}
+	return nil
+}
+
+type lidPortal struct {
+	ID   networkid.PortalID
+	MXID id.RoomID
+}
+
+var scanLIDPortal = dbutil.ConvertRowFn[lidPortal](func(row dbutil.Scannable) (portal lidPortal, err error) {
+	err = row.Scan(&portal.ID, &portal.MXID)
+	return
+})

@@ -34,6 +34,7 @@ import (
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waMmsRetry"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
@@ -163,7 +164,19 @@ func (wa *WhatsAppConnector) downloadStickerDirectMedia(ctx context.Context, par
 		return nil, fmt.Errorf("no WhatsApp client found on login %s", parsedID.UserLogin)
 	}
 	sticker, err := wa.MsgConv.GetCachedSticker(ctx, waClient.Client, parsedID.Sticker.PackID, parsedID.Sticker.FileHash)
-	if err != nil {
+	var httpErr whatsmeow.DownloadHTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusNotFound, http.StatusGone:
+			return nil, mautrix.MNotFound.WithMessage("Sticker pack not found")
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return nil, mautrix.MForbidden.WithMessage("WhatsApp denied access to the sticker pack")
+		case http.StatusTooManyRequests:
+			return nil, mautrix.MLimitExceeded.WithMessage("Rate limited by WhatsApp while fetching the sticker pack").WithCanRetry(true)
+		default:
+			return nil, mautrix.MUnknown.WithMessage("WhatsApp returned HTTP %d while fetching the sticker pack", httpErr.StatusCode).WithStatus(http.StatusBadGateway).WithCanRetry(true)
+		}
+	} else if err != nil {
 		return nil, err
 	} else if sticker == nil {
 		return nil, mautrix.MNotFound.WithMessage("Sticker not found in pack")
@@ -173,6 +186,9 @@ func (wa *WhatsAppConnector) downloadStickerDirectMedia(ctx context.Context, par
 
 func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, parsedID *waid.ParsedMediaID, params map[string]string) (mediaproxy.GetMediaResponse, error) {
 	msg, err := wa.Bridge.DB.Message.GetFirstPartByID(ctx, parsedID.UserLogin, parsedID.Message.String())
+	if err == nil && msg == nil && parsedID.Message.Chat.Server == types.HiddenUserServer && parsedID.Message.Sender.Server == types.DefaultUserServer {
+		msg, err = wa.getDirectMediaMessageWithLIDSender(ctx, parsedID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get message: %w", err)
 	} else if msg == nil {
@@ -213,6 +229,16 @@ func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, par
 		return nil, fmt.Errorf("no WhatsApp client found on login")
 	}
 	return wa.makeDirectMediaResponse(ctx, waClient, keys, keys.MimeType, msg.ID, keys, params)
+}
+
+func (wa *WhatsAppConnector) getDirectMediaMessageWithLIDSender(ctx context.Context, parsedID *waid.ParsedMediaID) (*database.Message, error) {
+	lid, err := wa.DeviceStore.LIDMap.GetLIDForPN(ctx, parsedID.Message.Sender)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get LID for sender: %w", err)
+	} else if lid.IsEmpty() {
+		return nil, nil
+	}
+	return wa.Bridge.DB.Message.GetFirstPartByID(ctx, parsedID.UserLogin, waid.MakeMessageID(parsedID.Message.Chat, lid, parsedID.Message.ID))
 }
 
 func (wa *WhatsAppConnector) makeDirectMediaResponse(

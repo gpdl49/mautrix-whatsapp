@@ -110,7 +110,7 @@ func (wa *WhatsAppConnector) Init(bridge *bridgev2.Bridge) {
 	wa.DB = wadb.New(bridge.ID, bridge.DB.Database, bridge.Log.With().Str("db_section", "whatsapp").Logger())
 	wa.MsgConv.DB = wa.DB
 	wa.Bridge.Commands.(*commands.Processor).AddHandlers(
-		cmdAccept, cmdSync, cmdInviteLink, cmdResolveLink, cmdJoin,
+		cmdAccept, cmdSync, cmdResetAppState, cmdInviteLink, cmdResolveLink, cmdJoin,
 		cmdCallReply, cmdCall, // homestacks: call auto-reply, outgoing call invites
 	)
 	wa.mediaEditCache = make(MediaEditCache)
@@ -168,10 +168,18 @@ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to migrate to LID DMs: %w", err)
 	}
+	err = wa.migrateMetaAIPortals(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to migrate Meta AI portals: %w", err)
+	}
 	go func() {
 		err = wa.syncMismatchingGhosts(wa.Bridge.BackgroundCtx)
 		if err != nil {
 			wa.Bridge.Log.Err(err).Msg("Failed to sync mismatching ghosts")
+		}
+		err = wa.removeRejoinedPNGhosts(wa.Bridge.BackgroundCtx)
+		if err != nil {
+			wa.Bridge.Log.Err(err).Msg("Failed to remove rejoined PN ghosts")
 		}
 	}()
 	return nil
@@ -239,7 +247,16 @@ func (wa *WhatsAppConnector) GenerateTransactionID(_ id.UserID, _ id.RoomID, _ e
 }
 
 func (wa *WhatsAppConnector) ResetHTTPTransport() {
-	// No-op for now, whatsmeow doesn't use the shared transport config yet
+	for _, login := range wa.Bridge.GetAllCachedUserLogins() {
+		client := login.Client.(*WhatsAppClient).Client
+		if client == nil {
+			continue
+		}
+		err := wa.updateProxy(login.Log.WithContext(wa.Bridge.BackgroundCtx), client, false)
+		if err != nil {
+			login.Log.Err(err).Msg("Failed to recreate HTTP clients")
+		}
+	}
 }
 
 func (wa *WhatsAppConnector) ResetNetworkConnections() {
